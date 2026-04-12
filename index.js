@@ -377,9 +377,12 @@ function createWidget() {
                 <p class="meddler-text">Нажми на меня~</p>
             </div>
             <div class="meddler-speech-tail"></div>
-            <button class="meddler-bubble-close" title="Закрыть">
-                <i class="fa-solid fa-xmark"></i>
-            </button>
+            <div class="meddler-bubble-actions">
+                <button class="meddler-bubble-regen" title="Перегенерировать">🔃</button>
+                <button class="meddler-bubble-close" title="Закрыть">
+                    <i class="fa-solid fa-xmark"></i>
+                </button>
+            </div>
         </div>
         <div class="meddler-typing-bubble">
             <div class="meddler-typing">
@@ -446,6 +449,7 @@ function createBar() {
         <div class="meddler-bar-typing">
             <span class="dot"></span><span class="dot"></span><span class="dot"></span>
         </div>
+        <button class="meddler-bar-regen-btn" title="Перегенерировать">🔃</button>
         <div class="meddler-bar-panel">
             <div class="meddler-bar-panel-inner">
                 <div class="meddler-panel-header">
@@ -587,9 +591,12 @@ function setupWidgetEvents() {
 
     const avatarBubble  = widget.querySelector('.meddler-avatar-bubble');
     const bubbleClose   = widget.querySelector('.meddler-bubble-close');
+    const bubbleRegen   = widget.querySelector('.meddler-bubble-regen');
     const panelClose    = widget.querySelector('.meddler-panel-close');
     const panelClear    = widget.querySelector('.meddler-panel-clear');
     const speechBubble  = widget.querySelector('.meddler-speech-bubble');
+
+    bubbleRegen?.addEventListener('click', (e) => { e.stopPropagation(); generateCommentary(true); });
 
     avatarBubble.addEventListener('mousedown', startDrag);
     avatarBubble.addEventListener('touchstart', startDragTouch, { passive: false });
@@ -701,6 +708,9 @@ function setupBarEvents() {
         e.preventDefault(); e.stopPropagation(); toggleBarPanel();
         if (navigator.vibrate) navigator.vibrate(50);
     });
+
+    bar.querySelector('.meddler-bar-regen-btn')?.addEventListener('click', (e) => { e.stopPropagation(); generateCommentary(true); });
+    bar.querySelector('.meddler-bar-regen-btn')?.addEventListener('touchend', (e) => { e.preventDefault(); e.stopPropagation(); generateCommentary(true); });
 
     bar.querySelector('.meddler-panel-close')?.addEventListener('click', (e) => { e.stopPropagation(); closeBarPanel(); });
     bar.querySelector('.meddler-panel-clear')?.addEventListener('click', (e) => {
@@ -1086,10 +1096,13 @@ function updateStatus(status) {
 function showTypingIndicator(show) {
     const widget = meddler.widget;
     if (widget) {
-        if (show) { widget.classList.add('is-typing'); widget.classList.remove('has-speech'); }
-        else { widget.classList.remove('is-typing'); }
+        if (show) { widget.classList.add('is-typing', 'is-generating'); widget.classList.remove('has-speech'); }
+        else { widget.classList.remove('is-typing', 'is-generating'); }
     }
-    if (meddler.bar) showBarTypingIndicator(show);
+    if (meddler.bar) {
+        meddler.bar.classList.toggle('is-generating', show);
+        showBarTypingIndicator(show);
+    }
 }
 
 function onMessageReceived() {
