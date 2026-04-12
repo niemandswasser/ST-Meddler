@@ -30,7 +30,6 @@ const defaultSettings = {
     // Источник изображения
     imageSource: 'card',        // 'card' | 'upload' | 'none'
     spriteData: '',             // base64 PNG (когда imageSource === 'upload')
-    connectionProfile: '',
     frequency: 5,
     frequencyLocked: false,
     messageCount: 0,
@@ -105,7 +104,6 @@ let meddler = {
     lastBarMessage: '',
     isGenerating: false,
     recentChatNames: [],
-    availableProfiles: [],
     lastTriggerTime: 0,
     chatJustChanged: false,
 };
@@ -149,41 +147,6 @@ async function executeSlashCommand(command) {
     return '';
 }
 
-async function getConnectionProfiles() {
-    try {
-        const result = await executeSlashCommand('/profile-list');
-        if (result) { const p = JSON.parse(result); if (Array.isArray(p)) return p; }
-    } catch (e) { /* ignored */ }
-    return [];
-}
-
-async function getCurrentProfile() {
-    try { return (await executeSlashCommand('/profile')).trim(); } catch { return ''; }
-}
-
-async function switchProfile(name) {
-    if (!name) return false;
-    try { await executeSlashCommand(`/profile ${name}`); return true; } catch { return false; }
-}
-
-async function populateProfileDropdown() {
-    const dropdown = document.getElementById('meddler-profile-select');
-    if (!dropdown) return;
-    const settings = getSettings();
-    meddler.availableProfiles = await getConnectionProfiles();
-    dropdown.innerHTML = '<option value="">-- Текущий профиль --</option>';
-    meddler.availableProfiles.forEach(name => {
-        const opt = document.createElement('option');
-        opt.value = name; opt.textContent = name;
-        if (settings.connectionProfile === name) opt.selected = true;
-        dropdown.appendChild(opt);
-    });
-    if (!meddler.availableProfiles.length) {
-        const opt = document.createElement('option');
-        opt.value = ''; opt.textContent = '(Профили не найдены)'; opt.disabled = true;
-        dropdown.appendChild(opt);
-    }
-}
 
 // =====================================
 // Quick API — прямые запросы, ST не трогаем
@@ -236,35 +199,39 @@ async function generateWithQuickApi(prompt) {
 
 async function fetchQuickApiModels() {
     const settings = getSettings();
-    const btn = document.getElementById('meddler-quickapi-fetch-models');
-    const hint = document.getElementById('meddler-models-hint');
-    const datalist = document.getElementById('meddler-models-list');
+    const btn     = document.getElementById('meddler-quickapi-fetch-models');
+    const hint    = document.getElementById('meddler-models-hint');
+    const select  = document.getElementById('meddler-quickapi-model-select');
 
-    if (!settings.quickApiUrl) { if (hint) { hint.textContent = '⚠️ Сначала введите URL API'; hint.style.display = 'block'; } return; }
+    if (!settings.quickApiUrl) {
+        if (hint) { hint.textContent = '⚠️ Сначала введите URL API'; hint.style.display = 'block'; }
+        return;
+    }
 
     if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i>'; }
-    if (hint) { hint.textContent = 'Загружаю модели...'; hint.style.display = 'block'; }
+    if (hint) { hint.textContent = 'Загружаю...'; hint.style.display = 'block'; }
 
     try {
-        const headers = { 'Content-Type': 'application/json' };
+        const headers = {};
         if (settings.quickApiKey) headers['Authorization'] = `Bearer ${settings.quickApiKey}`;
-
-        const res = await fetch(`${settings.quickApiUrl.replace(/\/$/, '')}/models`, { headers });
+        const res = await fetch(`${settings.quickApiUrl.replace(/\/+$/, '')}/models`, { headers });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const json = await res.json();
         const models = (json.data || json.models || []).map(m => m.id || m).filter(Boolean).sort();
 
-        if (datalist) {
-            datalist.innerHTML = '';
+        if (select) {
+            select.innerHTML = '<option value="">— выберите модель —</option>';
             models.forEach(id => {
                 const opt = document.createElement('option');
                 opt.value = id;
-                datalist.appendChild(opt);
+                opt.textContent = id;
+                if (settings.quickApiModel === id) opt.selected = true;
+                select.appendChild(opt);
             });
         }
-        if (hint) { hint.textContent = `✓ Загружено ${models.length} моделей — выберите из поля выше`; hint.style.display = 'block'; }
+        if (hint) { hint.textContent = `✓ ${models.length} моделей загружено`; hint.style.display = 'block'; }
     } catch (e) {
-        if (hint) { hint.textContent = `✗ Ошибка: ${e.message}`; hint.style.display = 'block'; }
+        if (hint) { hint.textContent = `✗ ${e.message}`; hint.style.display = 'block'; }
     } finally {
         if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fa-solid fa-rotate"></i>'; }
     }
@@ -1040,8 +1007,6 @@ async function generateCommentary(force = false) {
     showTypingIndicator(true);
     updateStatus('Думаю...');
 
-    let originalProfile = '', profileSwitched = false;
-
     try {
         let raw;
 
@@ -1051,16 +1016,7 @@ async function generateCommentary(force = false) {
             const prompt = buildCommentaryPrompt();
             raw = await generateWithQuickApi(prompt);
         } else {
-            // Стандартный путь через ST
-            if (settings.connectionProfile) {
-                originalProfile = await getCurrentProfile();
-                if (originalProfile !== settings.connectionProfile) {
-                    updateStatus('Переключаю профиль...');
-                    await switchProfile(settings.connectionProfile);
-                    profileSwitched = true;
-                    await new Promise(r => setTimeout(r, 100));
-                }
-            }
+            // Стандартный путь через ST (текущие настройки генерации)
             const prompt = buildCommentaryPrompt();
             updateStatus('Генерирую...');
             // skipWIAN=true — не тащим World Info и Author's Note из таверны
@@ -1081,7 +1037,6 @@ async function generateCommentary(force = false) {
         updateCommentaryText(`*бормочет* (ошибка: ${e.message || 'API error'})`);
         updateStatus('Ошибка!');
     } finally {
-        if (profileSwitched && originalProfile) await switchProfile(originalProfile);
         meddler.isGenerating = false;
         showTypingIndicator(false);
     }
@@ -1293,20 +1248,9 @@ async function setupSettingsUI() {
                 </div>
 
                 <hr class="sysHR" />
-                <h4 class="meddler-section-title">🔌 API и профиль</h4>
+                <h4 class="meddler-section-title">🔌 API</h4>
 
-                <div class="meddler-setting-row">
-                    <label for="meddler-profile-select">Профиль подключения:</label>
-                    <div class="meddler-char-select-row">
-                        <select id="meddler-profile-select" class="text_pole">
-                            <option value="">-- Текущий профиль --</option>
-                        </select>
-                        <button id="meddler-refresh-profiles" class="menu_button" title="Обновить">
-                            <i class="fa-solid fa-rotate"></i>
-                        </button>
-                    </div>
-                    <small>Отдельный API для Meddler. Оставь пустым — использовать текущий.</small>
-                </div>
+                <small class="meddler-hint">Укажите отдельный API во вкладке Quick API. В противном случае будут использованы активные настройки генерации.</small>
 
                 <div class="meddler-drawer">
                     <div class="meddler-drawer-toggle" id="meddler-quickapi-drawer-toggle">
@@ -1330,15 +1274,21 @@ async function setupSettingsUI() {
                                 <input type="password" id="meddler-quickapi-key" class="text_pole" placeholder="sk-... (необязательно)" />
                             </div>
                             <div class="meddler-setting-row">
-                                <label for="meddler-quickapi-model-input">Модель:</label>
+                                <label>Модель — из списка:</label>
                                 <div class="meddler-model-row">
-                                    <input type="text" id="meddler-quickapi-model-input" class="text_pole" placeholder="gpt-4o, claude-3-5-sonnet, ..." list="meddler-models-list" autocomplete="off" />
-                                    <button type="button" id="meddler-quickapi-fetch-models" class="menu_button" title="Загрузить список моделей">
+                                    <select id="meddler-quickapi-model-select" class="text_pole">
+                                        <option value="">— нажмите ⟳ для загрузки —</option>
+                                    </select>
+                                    <button type="button" id="meddler-quickapi-fetch-models" class="menu_button" title="Загрузить список моделей с API">
                                         <i class="fa-solid fa-rotate"></i>
                                     </button>
                                 </div>
-                                <datalist id="meddler-models-list"></datalist>
                                 <small id="meddler-models-hint" style="display:none;"></small>
+                            </div>
+                            <div class="meddler-model-or">— или —</div>
+                            <div class="meddler-setting-row">
+                                <label for="meddler-quickapi-model-input">Модель — вручную:</label>
+                                <input type="text" id="meddler-quickapi-model-input" class="text_pole" placeholder="gpt-4o, claude-3-5-sonnet, ..." autocomplete="off" />
                             </div>
                             <div class="meddler-setting-row">
                                 <div id="meddler-quickapi-status" class="meddler-quickapi-status">
@@ -1346,10 +1296,9 @@ async function setupSettingsUI() {
                                 </div>
                             </div>
                             <div class="meddler-setting-row meddler-quickapi-buttons">
-                                <button type="button" id="meddler-quickapi-connect" class="menu_button"><i class="fa-solid fa-plug"></i> Применить</button>
+                                <button type="button" id="meddler-quickapi-connect" class="menu_button"><i class="fa-solid fa-plug"></i> Проверить</button>
                                 <button type="button" id="meddler-quickapi-test" class="menu_button"><i class="fa-solid fa-flask"></i> Тест</button>
                             </div>
-                            <small>Переключает ST на Custom OpenAI endpoint на время генерации, затем восстанавливает</small>
                         </div>
                     </div>
                 </div>
@@ -1605,11 +1554,6 @@ async function setupSettingsUI() {
         sysPromptEl.addEventListener('input', e => { settings.systemPrompt = e.target.value; saveSettings(); });
     }
 
-    // Profile
-    await populateProfileDropdown();
-    document.getElementById('meddler-profile-select')?.addEventListener('change', e => { settings.connectionProfile = e.target.value; saveSettings(); });
-    document.getElementById('meddler-refresh-profiles')?.addEventListener('click', async () => { await populateProfileDropdown(); });
-
     // Frequency
     bindRange('meddler-frequency', 'meddler-frequency-input', 'meddler-frequency-lock',
         () => settings.frequency, v => { settings.frequency = v; saveSettings(); },
@@ -1736,10 +1680,29 @@ async function setupSettingsUI() {
         keyInput.addEventListener('change', e => { settings.quickApiKey = e.target.value.trim(); saveSettings(); });
     }
 
-    const modelInput = document.getElementById('meddler-quickapi-model-input');
+    const modelSelect = document.getElementById('meddler-quickapi-model-select');
+    const modelInput  = document.getElementById('meddler-quickapi-model-input');
+
+    // Восстанавливаем состояние: если модель совпадает с одним из option — select; иначе — в ручной ввод
+    if (modelInput) modelInput.value = settings.quickApiModel || '';
+
+    if (modelSelect) {
+        modelSelect.addEventListener('change', e => {
+            const val = e.target.value;
+            if (!val) return;
+            settings.quickApiModel = val;
+            if (modelInput) modelInput.value = ''; // сбрасываем ручной ввод
+            updateQuickApiStatus(); saveSettings();
+        });
+    }
+
     if (modelInput) {
-        modelInput.value = settings.quickApiModel || '';
-        modelInput.addEventListener('input', e => { settings.quickApiModel = e.target.value.trim(); updateQuickApiStatus(); saveSettings(); });
+        modelInput.addEventListener('input', e => {
+            const val = e.target.value.trim();
+            settings.quickApiModel = val;
+            if (val && modelSelect) modelSelect.value = ''; // сбрасываем select
+            updateQuickApiStatus(); saveSettings();
+        });
     }
 
     document.getElementById('meddler-quickapi-fetch-models')?.addEventListener('click', () => fetchQuickApiModels());
@@ -1816,13 +1779,11 @@ jQuery(async () => {
         setTimeout(async () => {
             populateCharacterDropdown();
             updateWidgetCharacter(); updateBarCharacter();
-            await populateProfileDropdown();
         }, 500);
     });
 
     setTimeout(populateCharacterDropdown, 1000);
     setTimeout(populateCharacterDropdown, 3000);
-    setTimeout(populateProfileDropdown, 1500);
 
     console.log(DEBUG_PREFIX, 'ST-Meddler готов!');
 });

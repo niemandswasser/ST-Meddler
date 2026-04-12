@@ -83,6 +83,11 @@
     font-size: calc(var(--kb-avatar-size) * 0.38);
 }
 
+@keyframes regenSpin {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(360deg); }
+}
+
 /* Notification dot */
 .meddler-notification-dot {
     position: absolute;
@@ -140,28 +145,45 @@
     word-wrap: break-word;
 }
 
-/* Close button */
-.meddler-bubble-close {
+/* Bubble action buttons (regen + close) */
+.meddler-bubble-actions {
     position: absolute;
-    top: -7px;
-    right: -7px;
+    top: -8px;
+    right: -8px;
+    display: flex;
+    gap: 3px;
+    opacity: 0;
+    transition: opacity 0.2s;
+}
+
+.meddler-speech-bubble:hover .meddler-bubble-actions { opacity: 1; }
+
+.meddler-bubble-regen,
+.meddler-bubble-close {
     width: 18px;
     height: 18px;
-    background: var(--kb-accent);
-    border: 2px solid #fff;
     border-radius: 50%;
-    color: #fff;
-    font-size: 8px;
+    border: none;
+    background: rgba(255,255,255,0.95);
+    box-shadow: 0 1px 4px rgba(0,0,0,0.18);
     cursor: pointer;
+    font-size: 11px;
     display: flex;
     align-items: center;
     justify-content: center;
-    opacity: 0;
-    transition: opacity 0.2s, transform 0.2s;
+    padding: 0;
+    transition: transform 0.15s, box-shadow 0.15s;
 }
 
-.meddler-speech-bubble:hover .meddler-bubble-close { opacity: 1; }
-.meddler-bubble-close:hover { transform: scale(1.2); }
+.meddler-bubble-close { background: var(--kb-accent); color: #fff; font-size: 8px; }
+
+.meddler-bubble-regen:hover,
+.meddler-bubble-close:hover { transform: scale(1.2); box-shadow: 0 2px 6px rgba(0,0,0,0.22); }
+
+#meddler-widget.is-generating .meddler-bubble-regen {
+    animation: regenSpin 1s linear infinite;
+}
+
 
 /* ========================================
    Tail — shared reset
@@ -584,6 +606,33 @@
 .meddler-bar-typing .dot:nth-child(2) { animation-delay: 0.18s; }
 .meddler-bar-typing .dot:nth-child(3) { animation-delay: 0.36s; }
 
+/* Regen button (bar) */
+.meddler-bar-regen-btn {
+    flex-shrink: 0;
+    width: 26px;
+    height: 26px;
+    border-radius: 50%;
+    border: none;
+    background: rgba(255,255,255,0.15);
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    opacity: 0.55;
+    transition: opacity 0.15s, background 0.15s, transform 0.1s;
+}
+
+.meddler-bar-regen-btn:hover { opacity: 1; background: rgba(255,255,255,0.28); }
+.meddler-bar-regen-btn:active { transform: scale(0.88); }
+
+#meddler-bar.is-generating .meddler-bar-regen-btn {
+    opacity: 1;
+    animation: regenSpin 1s linear infinite;
+}
+
 .meddler-bar-panel {
     position: absolute;
     bottom: calc(100% + 6px);
@@ -615,12 +664,37 @@
 
 #meddler-settings { margin-top: 10px; }
 
-#meddler-settings .inline-drawer-header {
+/* Custom drawer (не конфликтует с ST .inline-drawer) */
+.meddler-drawer { margin: 6px 0; }
+
+.meddler-drawer-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 7px 12px;
+    cursor: pointer;
     background: linear-gradient(90deg, rgba(176, 196, 222, 0.25) 0%, transparent 100%);
     border-left: 3px solid var(--kb-primary, #b0c4de);
+    border-radius: 0 6px 6px 0;
+    user-select: none;
 }
 
-#meddler-settings .inline-drawer-header b { color: #7a9cc0; }
+.meddler-drawer-toggle b { color: #7a9cc0; }
+
+.meddler-drawer-chevron {
+    font-size: 11px;
+    color: #7a9cc0;
+    transition: transform 0.2s ease;
+}
+
+.meddler-drawer-chevron.rotated { transform: rotate(180deg); }
+
+.meddler-drawer-content {
+    display: none;
+    padding: 8px 4px 4px;
+}
+
+.meddler-drawer-content.open { display: block; }
 
 .meddler-settings-panel .meddler-setting-row { margin-bottom: 14px; }
 
@@ -868,7 +942,31 @@
 .meddler-provider-btn.selected { border-color: #7a9cc0; background: rgba(122,156,192,0.12); color: #5a7a9c; font-weight: 600; }
 
 .meddler-model-select-row { display: flex; align-items: center; gap: 7px; }
+.meddler-model-row { display: flex; align-items: center; gap: 6px; }
+.meddler-model-row .text_pole { flex: 1; min-width: 0; }
+.meddler-model-row select { flex: 1; min-width: 0; }
 .meddler-model-select-row select { flex: 1; }
+
+.meddler-model-or {
+    text-align: center;
+    font-size: 11px;
+    color: #999;
+    margin: 2px 0 6px;
+    position: relative;
+}
+
+.meddler-model-or::before,
+.meddler-model-or::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    width: 38%;
+    height: 1px;
+    background: #ddd;
+}
+
+.meddler-model-or::before { left: 0; }
+.meddler-model-or::after  { right: 0; }
 
 .meddler-quickapi-status {
     padding: 5px 9px;
