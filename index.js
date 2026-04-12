@@ -62,8 +62,6 @@ const defaultSettings = {
     quickApiUrl: '',
     quickApiKey: '',
     quickApiModel: '',
-    openRouterModelsCache: [],
-    openRouterModelsCacheTime: 0,
 };
 
 // Цветовые темы
@@ -111,32 +109,6 @@ let meddler = {
     lastTriggerTime: 0,
     chatJustChanged: false,
 };
-
-// =====================================
-// Подавление тостов
-// =====================================
-let originalToastr = null;
-let originalToastify = null;
-
-function suppressToasts(suppress) {
-    if (suppress) {
-        if (typeof toastr !== 'undefined' && !originalToastr) {
-            originalToastr = { success: toastr.success, info: toastr.info, warning: toastr.warning, error: toastr.error };
-            toastr.success = () => {}; toastr.info = () => {}; toastr.warning = () => {}; toastr.error = () => {};
-        }
-        if (typeof Toastify !== 'undefined' && !originalToastify) {
-            originalToastify = Toastify;
-            window.Toastify = () => ({ showToast: () => {} });
-        }
-    } else {
-        if (originalToastr) {
-            toastr.success = originalToastr.success; toastr.info = originalToastr.info;
-            toastr.warning = originalToastr.warning; toastr.error = originalToastr.error;
-            originalToastr = null;
-        }
-        if (originalToastify) { window.Toastify = originalToastify; originalToastify = null; }
-    }
-}
 
 // =====================================
 // Настройки
@@ -214,64 +186,52 @@ async function populateProfileDropdown() {
 }
 
 // =====================================
-// Quick API
+// Quick API — прямые запросы, ST не трогаем
 // =====================================
-async function fetchOpenRouterModels() {
+// Прямой запрос к OpenAI-совместимому endpoint
+async function generateWithQuickApi(prompt) {
     const settings = getSettings();
-    if (settings.openRouterModelsCache.length > 0 && Date.now() - settings.openRouterModelsCacheTime < 3600000) {
-        return settings.openRouterModelsCache;
+    const base = settings.quickApiUrl.replace(/\/+$/, '');
+    const maxTokensMap = { short: 100, medium: 250, long: 500 };
+    const max_tokens = maxTokensMap[settings.commentaryLength] || 100;
+
+    const headers = { 'Content-Type': 'application/json' };
+    if (settings.quickApiKey) headers['Authorization'] = `Bearer ${settings.quickApiKey}`;
+
+    // Если задан системный промт — разбиваем на system+user, иначе всё в user
+    let messages;
+    if (settings.systemPrompt?.trim()) {
+        const langInstruction = LANGUAGES[settings.language]?.instruction || LANGUAGES.russian.instruction;
+        const lengthMap = { short: '1–2 предложения', medium: '3–5 предложений', long: '6–8 предложений' };
+        const context = getContext();
+        const recentMessages = context.chat?.slice(-settings.maxContextMessages) || [];
+        meddler.recentChatNames = [];
+        const chatLog = recentMessages.map(msg => {
+            const name = msg.is_user ? 'Пользователь' : (msg.name || 'Персонаж');
+            if (!meddler.recentChatNames.includes(name)) meddler.recentChatNames.push(name);
+            return `[${name}]: ${msg.mes}`;
+        }).join('\n\n');
+        messages = [
+            { role: 'system', content: settings.systemPrompt.trim() },
+            { role: 'user', content: `### ЖУРНАЛ РП\n${chatLog}\n\n(Длина: ${lengthMap[settings.commentaryLength] || lengthMap.short}. ${langInstruction} Только реплика, без описания действий.)` },
+        ];
+    } else {
+        messages = [{ role: 'user', content: prompt }];
     }
-    try {
-        const r = await fetch('https://openrouter.ai/api/v1/models');
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        const data = await r.json();
-        if (Array.isArray(data?.data)) {
-            const models = data.data.sort((a, b) => a.id.localeCompare(b.id));
-            settings.openRouterModelsCache = models;
-            settings.openRouterModelsCacheTime = Date.now();
-            saveSettings();
-            return models;
-        }
-    } catch (e) { /* ignored */ }
-    return settings.openRouterModelsCache || [];
-}
 
-async function getCurrentApiSettings() {
-    try {
-        return { api: (await executeSlashCommand('/api')).trim(), model: (await executeSlashCommand('/model')).trim() };
-    } catch { return { api: '', model: '' }; }
-}
+    const res = await fetch(`${base}/chat/completions`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ model: settings.quickApiModel, messages, max_tokens, temperature: 0.9 }),
+    });
 
-async function applyQuickApiSettings() {
-    const settings = getSettings();
-    if (!settings.quickApiEnabled || !settings.quickApiUrl || !settings.quickApiModel) return null;
-    const original = await getCurrentApiSettings();
-    try {
-        suppressToasts(true);
-        await executeSlashCommand('/api custom');
-        await executeSlashCommand(`/api-url ${settings.quickApiUrl}`);
-        await executeSlashCommand(`/model ${settings.quickApiModel}`);
-        // Попытка установить ключ через DOM (для custom OpenAI)
-        if (settings.quickApiKey) {
-            const keyEl = document.getElementById('api_key_custom');
-            if (keyEl) {
-                keyEl.value = settings.quickApiKey;
-                keyEl.dispatchEvent(new Event('input', { bubbles: true }));
-                keyEl.dispatchEvent(new Event('change', { bubbles: true }));
-            }
-        }
-        await new Promise(r => setTimeout(r, 150));
-        return original;
-    } catch { return original; } finally { suppressToasts(false); }
-}
+    if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`HTTP ${res.status}${text ? ': ' + text.slice(0, 120) : ''}`);
+    }
 
-async function restoreApiSettings(original) {
-    if (!original?.api && !original?.model) return;
-    try {
-        suppressToasts(true);
-        if (original.api) await executeSlashCommand(`/api ${original.api}`);
-        if (original.model) await executeSlashCommand(`/model ${original.model}`);
-    } catch { /* ignored */ } finally { suppressToasts(false); }
+    const json = await res.json();
+    return json.choices?.[0]?.message?.content?.trim() || '';
 }
 
 async function fetchQuickApiModels() {
@@ -329,17 +289,16 @@ async function connectQuickApi() {
     const btn = document.getElementById('meddler-quickapi-connect');
     const orig = btn?.innerHTML;
     try {
-        if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Подключение...'; }
-        const saved = await applyQuickApiSettings();
-        if (saved) {
-            await new Promise(r => setTimeout(r, 500));
-            await restoreApiSettings(saved);
-            if (btn) { btn.innerHTML = '<i class="fa-solid fa-check"></i> Подключено!'; }
-            setTimeout(() => { if (btn) { btn.innerHTML = orig; btn.disabled = false; } }, 2000);
-        } else { throw new Error('Не удалось применить настройки'); }
+        if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Проверка...'; }
+        const headers = {};
+        if (settings.quickApiKey) headers['Authorization'] = `Bearer ${settings.quickApiKey}`;
+        const res = await fetch(`${settings.quickApiUrl.replace(/\/+$/, '')}/models`, { headers });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        if (btn) { btn.innerHTML = '<i class="fa-solid fa-check"></i> Доступен!'; }
+        setTimeout(() => { if (btn) { btn.innerHTML = orig; btn.disabled = false; } }, 2000);
     } catch (e) {
         if (btn) { btn.innerHTML = '<i class="fa-solid fa-xmark"></i> Ошибка'; setTimeout(() => { btn.innerHTML = orig; btn.disabled = false; }, 2000); }
-        alert(`Ошибка: ${e.message}`);
+        alert(`Не удалось подключиться: ${e.message}`);
     }
 }
 
@@ -1071,27 +1030,32 @@ async function generateCommentary(force = false) {
     showTypingIndicator(true);
     updateStatus('Думаю...');
 
-    let originalProfile = '', profileSwitched = false, origApi = null, quickSwitched = false;
+    let originalProfile = '', profileSwitched = false;
 
     try {
-        if (settings.quickApiEnabled && settings.quickApiUrl && settings.quickApiModel) {
-            updateStatus(`Переключаю API...`);
-            origApi = await applyQuickApiSettings();
-            if (origApi) quickSwitched = true;
-        } else if (settings.connectionProfile) {
-            originalProfile = await getCurrentProfile();
-            if (originalProfile !== settings.connectionProfile) {
-                updateStatus('Переключаю профиль...');
-                await switchProfile(settings.connectionProfile);
-                profileSwitched = true;
-                await new Promise(r => setTimeout(r, 100));
-            }
-        }
+        let raw;
 
-        const prompt = buildCommentaryPrompt();
-        updateStatus('Генерирую...');
-        // skipWIAN=true — не тащим World Info и Author's Note из таверны
-        const raw = await generateQuietPrompt(prompt, false, true);
+        if (settings.quickApiEnabled && settings.quickApiUrl && settings.quickApiModel) {
+            // Прямой запрос — ST-шный API не трогаем вообще
+            updateStatus('Генерирую...');
+            const prompt = buildCommentaryPrompt();
+            raw = await generateWithQuickApi(prompt);
+        } else {
+            // Стандартный путь через ST
+            if (settings.connectionProfile) {
+                originalProfile = await getCurrentProfile();
+                if (originalProfile !== settings.connectionProfile) {
+                    updateStatus('Переключаю профиль...');
+                    await switchProfile(settings.connectionProfile);
+                    profileSwitched = true;
+                    await new Promise(r => setTimeout(r, 100));
+                }
+            }
+            const prompt = buildCommentaryPrompt();
+            updateStatus('Генерирую...');
+            // skipWIAN=true — не тащим World Info и Author's Note из таверны
+            raw = await generateQuietPrompt(prompt, false, true);
+        }
 
         if (raw) {
             const result = cleanCommentaryResponse(raw);
@@ -1107,8 +1071,7 @@ async function generateCommentary(force = false) {
         updateCommentaryText(`*бормочет* (ошибка: ${e.message || 'API error'})`);
         updateStatus('Ошибка!');
     } finally {
-        if (quickSwitched && origApi) await restoreApiSettings(origApi);
-        if (profileSwitched && originalProfile && !quickSwitched) await switchProfile(originalProfile);
+        if (profileSwitched && originalProfile) await switchProfile(originalProfile);
         meddler.isGenerating = false;
         showTypingIndicator(false);
     }
