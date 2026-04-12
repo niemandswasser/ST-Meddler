@@ -48,6 +48,8 @@ const defaultSettings = {
     uiBubblePosition: 'right',  // right | left | top | bottom
     uiBubbleWidth: 220,
     uiOpacity: 100,
+    systemPrompt: '',
+    commentaryLength: 'short',  // short | medium | long
     uiCustomColors: {
         primary: '#b0c4de',
         secondary: '#e8eef5',
@@ -57,9 +59,9 @@ const defaultSettings = {
     uiTickerSpeed: 50,
     uiTickerAlwaysScroll: true,
     quickApiEnabled: false,
-    quickApiProvider: '',
-    quickApiModel: '',
     quickApiUrl: '',
+    quickApiKey: '',
+    quickApiModel: '',
     openRouterModelsCache: [],
     openRouterModelsCacheTime: 0,
 };
@@ -249,7 +251,16 @@ async function applyQuickApiSettings() {
         await executeSlashCommand('/api custom');
         await executeSlashCommand(`/api-url ${settings.quickApiUrl}`);
         await executeSlashCommand(`/model ${settings.quickApiModel}`);
-        await new Promise(r => setTimeout(r, 100));
+        // Попытка установить ключ через DOM (для custom OpenAI)
+        if (settings.quickApiKey) {
+            const keyEl = document.getElementById('api_key_custom');
+            if (keyEl) {
+                keyEl.value = settings.quickApiKey;
+                keyEl.dispatchEvent(new Event('input', { bubbles: true }));
+                keyEl.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+        }
+        await new Promise(r => setTimeout(r, 150));
         return original;
     } catch { return original; } finally { suppressToasts(false); }
 }
@@ -261,6 +272,42 @@ async function restoreApiSettings(original) {
         if (original.api) await executeSlashCommand(`/api ${original.api}`);
         if (original.model) await executeSlashCommand(`/model ${original.model}`);
     } catch { /* ignored */ } finally { suppressToasts(false); }
+}
+
+async function fetchQuickApiModels() {
+    const settings = getSettings();
+    const btn = document.getElementById('meddler-quickapi-fetch-models');
+    const hint = document.getElementById('meddler-models-hint');
+    const datalist = document.getElementById('meddler-models-list');
+
+    if (!settings.quickApiUrl) { if (hint) { hint.textContent = '⚠️ Сначала введите URL API'; hint.style.display = 'block'; } return; }
+
+    if (btn) { btn.disabled = true; btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i>'; }
+    if (hint) { hint.textContent = 'Загружаю модели...'; hint.style.display = 'block'; }
+
+    try {
+        const headers = { 'Content-Type': 'application/json' };
+        if (settings.quickApiKey) headers['Authorization'] = `Bearer ${settings.quickApiKey}`;
+
+        const res = await fetch(`${settings.quickApiUrl.replace(/\/$/, '')}/models`, { headers });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const json = await res.json();
+        const models = (json.data || json.models || []).map(m => m.id || m).filter(Boolean).sort();
+
+        if (datalist) {
+            datalist.innerHTML = '';
+            models.forEach(id => {
+                const opt = document.createElement('option');
+                opt.value = id;
+                datalist.appendChild(opt);
+            });
+        }
+        if (hint) { hint.textContent = `✓ Загружено ${models.length} моделей — выберите из поля выше`; hint.style.display = 'block'; }
+    } catch (e) {
+        if (hint) { hint.textContent = `✗ Ошибка: ${e.message}`; hint.style.display = 'block'; }
+    } finally {
+        if (btn) { btn.disabled = false; btn.innerHTML = '<i class="fa-solid fa-rotate"></i>'; }
+    }
 }
 
 function updateQuickApiStatus() {
@@ -898,7 +945,23 @@ function buildCommentaryPrompt() {
         return `[${name}]: ${msg.mes}`;
     }).join('\n\n');
 
-    // Личность
+    const lengthMap = { short: '1–2 предложения', medium: '3–5 предложений', long: '6–8 предложений' };
+    const lengthRule = lengthMap[settings.commentaryLength] || lengthMap.short;
+    const langInstruction = LANGUAGES[settings.language]?.instruction || LANGUAGES.russian.instruction;
+    const name = settings.characterName || 'Meddler';
+
+    // Если задан свой системный промт — используем только его
+    if (settings.systemPrompt?.trim()) {
+        return `${settings.systemPrompt.trim()}
+
+### ЖУРНАЛ РП
+${chatLog}
+
+### ОТВЕТ
+(Длина: ${lengthRule}. ${langInstruction} Только реплика ${name}, без описания действий):`.trim();
+    }
+
+    // Автоматический промт
     let characterPersonality = '';
     if (settings.characterSource === 'custom') {
         characterPersonality = settings.personalityText || '';
@@ -910,16 +973,12 @@ function buildCommentaryPrompt() {
         }
     }
 
-    // Тон
     let styleText;
     if (settings.commentaryStyle === 'custom' && settings.customTone) {
         styleText = settings.customTone;
     } else {
         styleText = COMMENTARY_STYLES[settings.commentaryStyle] || COMMENTARY_STYLES.snarky;
     }
-
-    const name = settings.characterName || 'Meddler';
-    const langInstruction = LANGUAGES[settings.language]?.instruction || LANGUAGES.russian.instruction;
 
     const personaBlock = characterPersonality
         ? `Ты — ${name}.\n[Личность]\n${characterPersonality}`
@@ -937,7 +996,7 @@ ${personaBlock}
 1. Реагируй согласно своей личности (${name}).
 2. НЕ участвуй в ролевой игре.
 3. НЕ цитируй диалоги дословно.
-4. Кратко: 1–3 предложения.
+4. Длина: ${lengthRule}.
 5. ${langInstruction}
 
 ### ЖУРНАЛ РП
@@ -1015,7 +1074,7 @@ async function generateCommentary(force = false) {
     let originalProfile = '', profileSwitched = false, origApi = null, quickSwitched = false;
 
     try {
-        if (settings.quickApiEnabled && settings.quickApiProvider && settings.quickApiModel) {
+        if (settings.quickApiEnabled && settings.quickApiUrl && settings.quickApiModel) {
             updateStatus(`Переключаю API...`);
             origApi = await applyQuickApiSettings();
             if (origApi) quickSwitched = true;
@@ -1031,7 +1090,8 @@ async function generateCommentary(force = false) {
 
         const prompt = buildCommentaryPrompt();
         updateStatus('Генерирую...');
-        const raw = await generateQuietPrompt(prompt, false, false);
+        // skipWIAN=true — не тащим World Info и Author's Note из таверны
+        const raw = await generateQuietPrompt(prompt, false, true);
 
         if (raw) {
             const result = cleanCommentaryResponse(raw);
@@ -1240,6 +1300,22 @@ async function setupSettingsUI() {
                     </select>
                 </div>
 
+                <div class="meddler-setting-row">
+                    <label for="meddler-length-select">Длина комментария:</label>
+                    <select id="meddler-length-select" class="text_pole">
+                        <option value="short">🩳 Короткий (1–2 предложения)</option>
+                        <option value="medium">📝 Средний (3–5 предложений)</option>
+                        <option value="long">📜 Длинный (6–8 предложений)</option>
+                    </select>
+                </div>
+
+                <div class="meddler-setting-row">
+                    <label for="meddler-system-prompt">Системный промт:</label>
+                    <textarea id="meddler-system-prompt" class="meddler-tone-textarea"
+                        placeholder="Опционально. Полностью заменяет автоматический промт. Журнал РП и инструкция по длине добавятся автоматически в конец."></textarea>
+                    <small>Если задан — авто-промт с личностью и тоном игнорируется</small>
+                </div>
+
                 <hr class="sysHR" />
                 <h4 class="meddler-section-title">🔌 API и профиль</h4>
 
@@ -1256,12 +1332,12 @@ async function setupSettingsUI() {
                     <small>Отдельный API для Meddler. Оставь пустым — использовать текущий.</small>
                 </div>
 
-                <div class="inline-drawer">
-                    <div class="inline-drawer-toggle inline-drawer-header" id="meddler-quickapi-drawer-toggle">
+                <div class="meddler-drawer">
+                    <div class="meddler-drawer-toggle" id="meddler-quickapi-drawer-toggle">
                         <b>⚡ Quick API</b>
-                        <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+                        <i class="meddler-drawer-chevron fa-solid fa-chevron-down"></i>
                     </div>
-                    <div class="inline-drawer-content" id="meddler-quickapi-drawer-content">
+                    <div class="meddler-drawer-content" id="meddler-quickapi-drawer-content">
                         <div class="meddler-setting-row">
                             <label class="checkbox_label" for="meddler-quickapi-enabled">
                                 <input type="checkbox" id="meddler-quickapi-enabled" />
@@ -1270,12 +1346,23 @@ async function setupSettingsUI() {
                         </div>
                         <div id="meddler-quickapi-options" class="meddler-quickapi-options">
                             <div class="meddler-setting-row">
-                                <label for="meddler-quickapi-url">URL API:</label>
+                                <label for="meddler-quickapi-url">URL API (base):</label>
                                 <input type="text" id="meddler-quickapi-url" class="text_pole" placeholder="https://your-server.com/v1" />
                             </div>
                             <div class="meddler-setting-row">
-                                <label for="meddler-quickapi-model-input">Название модели:</label>
-                                <input type="text" id="meddler-quickapi-model-input" class="text_pole" placeholder="Идентификатор модели..." />
+                                <label for="meddler-quickapi-key">Ключ API:</label>
+                                <input type="password" id="meddler-quickapi-key" class="text_pole" placeholder="sk-... (необязательно)" />
+                            </div>
+                            <div class="meddler-setting-row">
+                                <label for="meddler-quickapi-model-input">Модель:</label>
+                                <div class="meddler-model-row">
+                                    <input type="text" id="meddler-quickapi-model-input" class="text_pole" placeholder="gpt-4o, claude-3-5-sonnet, ..." list="meddler-models-list" autocomplete="off" />
+                                    <button type="button" id="meddler-quickapi-fetch-models" class="menu_button" title="Загрузить список моделей">
+                                        <i class="fa-solid fa-rotate"></i>
+                                    </button>
+                                </div>
+                                <datalist id="meddler-models-list"></datalist>
+                                <small id="meddler-models-hint" style="display:none;"></small>
                             </div>
                             <div class="meddler-setting-row">
                                 <div id="meddler-quickapi-status" class="meddler-quickapi-status">
@@ -1283,9 +1370,10 @@ async function setupSettingsUI() {
                                 </div>
                             </div>
                             <div class="meddler-setting-row meddler-quickapi-buttons">
-                                <button type="button" id="meddler-quickapi-connect" class="menu_button"><i class="fa-solid fa-plug"></i> Подключить</button>
+                                <button type="button" id="meddler-quickapi-connect" class="menu_button"><i class="fa-solid fa-plug"></i> Применить</button>
                                 <button type="button" id="meddler-quickapi-test" class="menu_button"><i class="fa-solid fa-flask"></i> Тест</button>
                             </div>
+                            <small>Переключает ST на Custom OpenAI endpoint на время генерации, затем восстанавливает</small>
                         </div>
                     </div>
                 </div>
@@ -1531,15 +1619,20 @@ async function setupSettingsUI() {
     // Language
     bind('meddler-language-select', 'change', e => { settings.language = e.target.value; saveSettings(); }, el => { el.value = settings.language || 'russian'; });
 
+    // Commentary length
+    bind('meddler-length-select', 'change', e => { settings.commentaryLength = e.target.value; saveSettings(); }, el => { el.value = settings.commentaryLength || 'short'; });
+
+    // System prompt
+    const sysPromptEl = document.getElementById('meddler-system-prompt');
+    if (sysPromptEl) {
+        sysPromptEl.value = settings.systemPrompt || '';
+        sysPromptEl.addEventListener('input', e => { settings.systemPrompt = e.target.value; saveSettings(); });
+    }
+
     // Profile
     await populateProfileDropdown();
     document.getElementById('meddler-profile-select')?.addEventListener('change', e => { settings.connectionProfile = e.target.value; saveSettings(); });
     document.getElementById('meddler-refresh-profiles')?.addEventListener('click', async () => { await populateProfileDropdown(); });
-
-    // Drawer toggle → refresh
-    document.querySelector('#meddler-settings .inline-drawer-toggle')?.addEventListener('click', () => {
-        setTimeout(async () => { populateCharacterDropdown(); await populateProfileDropdown(); }, 100);
-    });
 
     // Frequency
     bindRange('meddler-frequency', 'meddler-frequency-input', 'meddler-frequency-lock',
@@ -1642,16 +1735,17 @@ async function setupSettingsUI() {
     // Quick API
     bind('meddler-quickapi-enabled', 'change', e => { settings.quickApiEnabled = e.target.checked; updateQuickApiStatus(); saveSettings(); }, el => { el.checked = settings.quickApiEnabled; });
 
-    // Quick API drawer
-    const qaToggle = document.getElementById('meddler-quickapi-drawer-toggle');
-    const qaContent = document.getElementById('meddler-quickapi-drawer-content');
-    if (qaToggle && qaContent) {
-        qaToggle.addEventListener('click', () => {
-            const icon = qaToggle.querySelector('.inline-drawer-icon');
-            const open = qaContent.style.display !== 'none';
-            qaContent.style.display = open ? 'none' : 'block';
-            if (icon) { icon.classList.toggle('up', !open); icon.classList.toggle('down', open); }
-        });
+    // Quick API drawer — собственный, не зависящий от ST-классов
+    {
+        const toggle  = document.getElementById('meddler-quickapi-drawer-toggle');
+        const content = document.getElementById('meddler-quickapi-drawer-content');
+        if (toggle && content) {
+            toggle.addEventListener('click', () => {
+                const isOpen = content.classList.contains('open');
+                content.classList.toggle('open', !isOpen);
+                toggle.querySelector('.meddler-drawer-chevron')?.classList.toggle('rotated', !isOpen);
+            });
+        }
     }
 
     const urlInput = document.getElementById('meddler-quickapi-url');
@@ -1660,12 +1754,19 @@ async function setupSettingsUI() {
         urlInput.addEventListener('change', e => { settings.quickApiUrl = e.target.value.trim(); updateQuickApiStatus(); saveSettings(); });
     }
 
+    const keyInput = document.getElementById('meddler-quickapi-key');
+    if (keyInput) {
+        keyInput.value = settings.quickApiKey || '';
+        keyInput.addEventListener('change', e => { settings.quickApiKey = e.target.value.trim(); saveSettings(); });
+    }
+
     const modelInput = document.getElementById('meddler-quickapi-model-input');
     if (modelInput) {
         modelInput.value = settings.quickApiModel || '';
-        modelInput.addEventListener('change', e => { settings.quickApiModel = e.target.value.trim(); updateQuickApiStatus(); saveSettings(); });
+        modelInput.addEventListener('input', e => { settings.quickApiModel = e.target.value.trim(); updateQuickApiStatus(); saveSettings(); });
     }
 
+    document.getElementById('meddler-quickapi-fetch-models')?.addEventListener('click', () => fetchQuickApiModels());
     document.getElementById('meddler-quickapi-connect')?.addEventListener('click', () => connectQuickApi());
     document.getElementById('meddler-quickapi-test')?.addEventListener('click', () => {
         if (!settings.quickApiEnabled) { alert('Включи Quick API!'); return; }
