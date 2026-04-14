@@ -42,7 +42,9 @@ const defaultSettings = {
     customTone: '',
     displayMode: 'widget',
     uiTheme: 'soft',            // soft | pink | lavender | mint | night | custom
-    uiAvatarSize: 'medium',
+    uiAvatarSize: 'medium',     // small | medium | large | custom
+    uiAvatarSizeCustom: 80,     // px, when uiAvatarSize === 'custom'
+    uiAvatarStyle: 'circle',    // 'circle' | 'full'
     uiBubblePosition: 'right',  // right | left | top | bottom
     uiBubbleWidth: 220,
     uiOpacity: 100,
@@ -286,9 +288,13 @@ function applyUITheme() {
     widget.style.setProperty('--kb-accent',    colors.accent);
     widget.style.setProperty('--kb-text',      colors.text);
 
-    const avatarSize = AVATAR_SIZES[settings.uiAvatarSize] || AVATAR_SIZES.medium;
+    const avatarSize = settings.uiAvatarSize === 'custom'
+        ? (parseInt(settings.uiAvatarSizeCustom) || 80)
+        : (AVATAR_SIZES[settings.uiAvatarSize] || AVATAR_SIZES.medium);
     widget.style.setProperty('--kb-avatar-size',   `${avatarSize}px`);
     widget.style.setProperty('--kb-bubble-offset', `${avatarSize + 10}px`);
+
+    widget.classList.toggle('avatar-full', settings.uiAvatarStyle === 'full');
 
     widget.classList.remove('bubble-right', 'bubble-left', 'bubble-top', 'bubble-bottom');
     widget.classList.add(`bubble-${settings.uiBubblePosition}`);
@@ -1440,11 +1446,29 @@ async function setupSettingsUI() {
                     </div>
                     <div class="meddler-setting-row">
                         <label for="meddler-avatar-size">Размер аватара:</label>
-                        <select id="meddler-avatar-size" class="text_pole">
-                            <option value="small">Маленький (55px)</option>
-                            <option value="medium">Средний (70px)</option>
-                            <option value="large">Большой (90px)</option>
-                        </select>
+                        <div style="display:flex;gap:6px;align-items:center;flex:1;">
+                            <select id="meddler-avatar-size" class="text_pole" style="flex:1;">
+                                <option value="small">Маленький (55px)</option>
+                                <option value="medium">Средний (70px)</option>
+                                <option value="large">Большой (90px)</option>
+                                <option value="custom">✏️ Свой</option>
+                            </select>
+                            <input type="number" id="meddler-avatar-size-custom" class="text_pole"
+                                min="30" max="400" style="width:64px;display:none;" placeholder="px" />
+                        </div>
+                    </div>
+                    <div class="meddler-setting-row">
+                        <label>Форма аватара:</label>
+                        <div class="meddler-radio-group">
+                            <label class="meddler-radio-label">
+                                <input type="radio" name="meddler-avatar-style" id="meddler-avatar-style-circle" value="circle" />
+                                <span>⭕ Круглая рамка</span>
+                            </label>
+                            <label class="meddler-radio-label">
+                                <input type="radio" name="meddler-avatar-style" id="meddler-avatar-style-full" value="full" />
+                                <span>🖼️ Целая картинка</span>
+                            </label>
+                        </div>
                     </div>
                     <div class="meddler-setting-row">
                         <label for="meddler-opacity">Прозрачность:</label>
@@ -1711,7 +1735,36 @@ async function setupSettingsUI() {
         });
     }
 
-    bind('meddler-avatar-size', 'change', e => { settings.uiAvatarSize = e.target.value; applyUITheme(); saveSettings(); }, el => { el.value = settings.uiAvatarSize; });
+    const avatarSizeSelect = /** @type {HTMLSelectElement|null} */ (document.getElementById('meddler-avatar-size'));
+    const avatarSizeCustom = /** @type {HTMLInputElement|null} */ (document.getElementById('meddler-avatar-size-custom'));
+    function syncAvatarSizeCustomVisibility() {
+        if (avatarSizeCustom) avatarSizeCustom.style.display = settings.uiAvatarSize === 'custom' ? 'block' : 'none';
+    }
+    if (avatarSizeSelect) {
+        avatarSizeSelect.value = settings.uiAvatarSize;
+        avatarSizeSelect.addEventListener('change', e => {
+            settings.uiAvatarSize = /** @type {HTMLSelectElement} */ (e.target).value;
+            syncAvatarSizeCustomVisibility();
+            applyUITheme(); saveSettings();
+        });
+    }
+    if (avatarSizeCustom) {
+        avatarSizeCustom.value = settings.uiAvatarSizeCustom ?? 80;
+        avatarSizeCustom.addEventListener('input', e => {
+            const v = parseInt(/** @type {HTMLInputElement} */ (e.target).value);
+            if (v >= 30 && v <= 400) { settings.uiAvatarSizeCustom = v; applyUITheme(); saveSettings(); }
+        });
+    }
+    syncAvatarSizeCustomVisibility();
+
+    ['meddler-avatar-style-circle', 'meddler-avatar-style-full'].forEach(id => {
+        document.getElementById(id)?.addEventListener('change', e => {
+            const t = /** @type {HTMLInputElement} */ (e.target);
+            if (t?.checked) { settings.uiAvatarStyle = t.value; applyUITheme(); saveSettings(); }
+        });
+    });
+    const avatarStyleEl = /** @type {HTMLInputElement|null} */ (document.getElementById(`meddler-avatar-style-${settings.uiAvatarStyle || 'circle'}`));
+    if (avatarStyleEl) avatarStyleEl.checked = true;
 
     // Opacity
     const opacitySlider = document.getElementById('meddler-opacity');

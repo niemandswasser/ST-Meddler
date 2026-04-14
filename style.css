@@ -88,6 +88,44 @@
     font-size: calc(var(--kb-avatar-size) * 0.38);
 }
 
+/* ========================================
+   Full-image avatar style (no circle frame)
+   ======================================== */
+
+#meddler-widget.avatar-full {
+    width: auto;
+    height: auto;
+}
+
+#meddler-widget.avatar-full .meddler-avatar-bubble {
+    width: auto;
+    height: auto;
+    border-radius: 6px;
+    border: none;
+    background: transparent;
+    box-shadow: none;
+    overflow: visible;
+}
+
+#meddler-widget.avatar-full .meddler-avatar-bubble:hover {
+    box-shadow: none;
+    transform: scale(1.03);
+}
+
+#meddler-widget.avatar-full .meddler-avatar {
+    width: auto;
+    height: var(--kb-avatar-size);
+    max-height: 220px;
+    object-fit: contain;
+    border-radius: 0;
+    filter: drop-shadow(0 2px 10px rgba(0,0,0,0.25));
+}
+
+#meddler-widget.avatar-full .meddler-avatar-placeholder {
+    width: var(--kb-avatar-size);
+    height: var(--kb-avatar-size);
+}
+
 @keyframes regenSpin {
     from { transform: rotate(0deg); }
     to   { transform: rotate(360deg); }
