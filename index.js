@@ -64,6 +64,7 @@ const defaultSettings = {
     quickApiUrl: '',
     quickApiKey: '',
     quickApiModel: '',
+    chatHistoryLimit: 10,
 };
 
 // Цветовые темы
@@ -111,6 +112,7 @@ let meddler = {
     chatJustChanged: false,
     sleepTimer: null,
     pendingBarText: null,
+    chatHistory: [],
 };
 
 // =====================================
@@ -156,15 +158,33 @@ async function executeSlashCommand(command) {
 // =====================================
 // Quick API — прямые запросы, ST не трогаем
 // =====================================
+// Низкоуровневый POST в OpenAI-совместимый endpoint
+async function postQuickApi(messages, max_tokens) {
+    const settings = getSettings();
+    const base = settings.quickApiUrl.replace(/\/+$/, '');
+    const headers = { 'Content-Type': 'application/json' };
+    if (settings.quickApiKey) headers['Authorization'] = `Bearer ${settings.quickApiKey}`;
+
+    const res = await fetch(`${base}/chat/completions`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ model: settings.quickApiModel, messages, max_tokens, temperature: 0.9 }),
+    });
+
+    if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`HTTP ${res.status}${text ? ': ' + text.slice(0, 120) : ''}`);
+    }
+
+    const json = await res.json();
+    return json.choices?.[0]?.message?.content?.trim() || '';
+}
+
 // Прямой запрос к OpenAI-совместимому endpoint
 async function generateWithQuickApi(prompt) {
     const settings = getSettings();
-    const base = settings.quickApiUrl.replace(/\/+$/, '');
     const maxTokensMap = { short: 100, medium: 250, long: 500 };
     const max_tokens = maxTokensMap[settings.commentaryLength] || 100;
-
-    const headers = { 'Content-Type': 'application/json' };
-    if (settings.quickApiKey) headers['Authorization'] = `Bearer ${settings.quickApiKey}`;
 
     // Если задан системный промт — разбиваем на system+user, иначе всё в user
     let messages;
@@ -187,19 +207,7 @@ async function generateWithQuickApi(prompt) {
         messages = [{ role: 'user', content: prompt }];
     }
 
-    const res = await fetch(`${base}/chat/completions`, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ model: settings.quickApiModel, messages, max_tokens, temperature: 0.9 }),
-    });
-
-    if (!res.ok) {
-        const text = await res.text().catch(() => '');
-        throw new Error(`HTTP ${res.status}${text ? ': ' + text.slice(0, 120) : ''}`);
-    }
-
-    const json = await res.json();
-    return json.choices?.[0]?.message?.content?.trim() || '';
+    return postQuickApi(messages, max_tokens);
 }
 
 async function fetchQuickApiModels() {
@@ -386,6 +394,10 @@ function createWidget() {
                     <div class="meddler-history-item"><p>Выбери персонажа в настройках~</p></div>
                 </div>
             </div>
+            <div class="meddler-chat-input-row">
+                <input type="text" class="meddler-chat-input" placeholder="Спросить..." maxlength="500" />
+                <button class="meddler-chat-send" title="Отправить"><i class="fa-solid fa-paper-plane"></i></button>
+            </div>
             <div class="meddler-panel-footer">
                 <div class="meddler-status-row">
                     <span class="meddler-status-icon">◉</span>
@@ -443,6 +455,10 @@ function createBar() {
                     <div class="meddler-history">
                         <div class="meddler-history-item"><p>Выбери персонажа в настройках~</p></div>
                     </div>
+                </div>
+                <div class="meddler-chat-input-row">
+                    <input type="text" class="meddler-chat-input" placeholder="Спросить..." maxlength="500" />
+                    <button class="meddler-chat-send" title="Отправить"><i class="fa-solid fa-paper-plane"></i></button>
                 </div>
                 <div class="meddler-panel-footer">
                     <div class="meddler-status-row">
@@ -609,6 +625,20 @@ function setupWidgetEvents() {
         if (h) h.innerHTML = '';
     });
 
+    const chatInput = widget.querySelector('.meddler-chat-input');
+    const chatSend  = widget.querySelector('.meddler-chat-send');
+    const sendChat = () => {
+        const q = chatInput?.value?.trim();
+        if (!q) return;
+        chatInput.value = '';
+        generateChatReply(q);
+    };
+    chatSend?.addEventListener('click', (e) => { e.stopPropagation(); sendChat(); });
+    chatInput?.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
+    });
+    chatInput?.addEventListener('click', (e) => e.stopPropagation());
+
     document.addEventListener('click', (e) => {
         if (widget.classList.contains('panel-open') && !widget.contains(e.target)) {
             widget.classList.remove('panel-open');
@@ -720,6 +750,21 @@ function setupBarEvents() {
         const h = bar.querySelector('.meddler-history');
         if (h) { h.innerHTML = ''; meddler.lastBarMessage = ''; }
     });
+
+    const chatInput = bar.querySelector('.meddler-chat-input');
+    const chatSend  = bar.querySelector('.meddler-chat-send');
+    const sendChat = () => {
+        const q = chatInput?.value?.trim();
+        if (!q) return;
+        chatInput.value = '';
+        generateChatReply(q);
+    };
+    chatSend?.addEventListener('click', (e) => { e.stopPropagation(); sendChat(); });
+    chatInput?.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
+    });
+    chatInput?.addEventListener('click', (e) => e.stopPropagation());
+
     document.addEventListener('click', (e) => {
         if (bar.classList.contains('panel-open') && !bar.contains(e.target)) closeBarPanel();
     });
@@ -1022,6 +1067,97 @@ ${chatLog}
 }
 
 // =====================================
+// Промпт болтовни
+// =====================================
+function buildChatPrompt(question) {
+    const settings = getSettings();
+    const context = getContext();
+    const chars = context.characters || [];
+
+    const recentMessages = context.chat?.slice(-settings.maxContextMessages) || [];
+    meddler.recentChatNames = [];
+    const chatLog = recentMessages.map(msg => {
+        const name = msg.is_user ? 'Пользователь' : (msg.name || 'Персонаж');
+        if (!meddler.recentChatNames.includes(name)) meddler.recentChatNames.push(name);
+        return `[${name}]: ${msg.mes}`;
+    }).join('\n\n');
+
+    const lengthMap = { short: '1–2 предложения', medium: '3–5 предложений', long: '6–8 предложений' };
+    const lengthRule = lengthMap[settings.commentaryLength] || lengthMap.short;
+    const langInstruction = LANGUAGES[settings.language]?.instruction || LANGUAGES.russian.instruction;
+    const name = settings.characterName || 'Meddler';
+
+    const limit = Math.max(0, parseInt(settings.chatHistoryLimit) || 0);
+    const mem = limit > 0 ? meddler.chatHistory.slice(-limit) : [];
+    const memText = mem.length
+        ? mem.map(m => `[${m.role === 'user' ? 'Пользователь' : name}]: ${m.content}`).join('\n\n')
+        : '(пусто)';
+
+    if (settings.systemPrompt?.trim()) {
+        return `${settings.systemPrompt.trim()}
+
+### ЖУРНАЛ РП (для контекста)
+${chatLog || '(пусто)'}
+
+### ВАША БЕСЕДА С ПОЛЬЗОВАТЕЛЕМ
+${memText}
+
+### НОВАЯ РЕПЛИКА ПОЛЬЗОВАТЕЛЯ
+${question}
+
+### ОТВЕТ
+(Длина: ${lengthRule}. ${langInstruction} Только прямая реплика ${name} пользователю):`.trim();
+    }
+
+    let characterPersonality = '';
+    if (settings.characterSource === 'custom') {
+        characterPersonality = settings.personalityText || '';
+    } else if (settings.characterId !== null && chars[settings.characterId]) {
+        const char = chars[settings.characterId];
+        characterPersonality = char.description || '';
+        if (char.personality) characterPersonality += '\n' + char.personality;
+    }
+
+    let styleText;
+    if (settings.commentaryStyle === 'custom' && settings.customTone) {
+        styleText = settings.customTone;
+    } else {
+        styleText = COMMENTARY_STYLES[settings.commentaryStyle] || COMMENTARY_STYLES.snarky;
+    }
+
+    const personaBlock = characterPersonality
+        ? `Ты — ${name}.\n[Личность]\n${characterPersonality}`
+        : `Ты — ${name}.\n[Стиль]\n${styleText}`;
+
+    return `
+### ЛИЧНОСТЬ
+${personaBlock}
+
+### ЗАДАЧА
+Ты общаешься с пользователем напрямую. Пользователь видел ролевую игру ниже и пишет тебе. Отвечай ему в своём характере, учитывая контекст РП и вашу предыдущую беседу.
+
+### ПРАВИЛА
+1. Отвечай от первого лица как ${name}, прямой репликой пользователю.
+2. НЕ участвуй в ролевой игре и НЕ отвечай за её персонажей.
+3. НЕ цитируй диалоги РП дословно.
+4. Длина: ${lengthRule}.
+5. ${langInstruction}
+
+### ЖУРНАЛ РП (для контекста)
+${chatLog || '(пусто)'}
+
+### ВАША БЕСЕДА С ПОЛЬЗОВАТЕЛЕМ
+${memText}
+
+### НОВАЯ РЕПЛИКА ПОЛЬЗОВАТЕЛЯ
+${question}
+
+### ОТВЕТ
+(Как ${name}, ответ пользователю):
+`.trim();
+}
+
+// =====================================
 // Очистка ответа
 // =====================================
 function cleanCommentaryResponse(raw) {
@@ -1120,6 +1256,79 @@ async function generateCommentary(force = false) {
     }
 }
 
+function addUserMessageToHistory(text) {
+    [meddler.widget, meddler.bar].forEach(el => {
+        if (!el) return;
+        const h = el.querySelector('.meddler-history');
+        if (!h) return;
+        const item = document.createElement('div');
+        item.className = 'meddler-history-item user-msg new';
+        const p = document.createElement('p');
+        p.textContent = text;
+        item.appendChild(p);
+        h.insertBefore(item, h.firstChild);
+        const items = h.querySelectorAll('.meddler-history-item');
+        if (items.length > 20) items[items.length - 1].remove();
+        setTimeout(() => item.classList.remove('new'), 500);
+    });
+}
+
+async function generateChatReply(rawQuestion) {
+    const settings = getSettings();
+    if (!settings.enabled) return;
+    if (meddler.isGenerating) return;
+    const question = (rawQuestion || '').trim();
+    if (!question) return;
+
+    const hasCharacter = settings.characterSource === 'custom'
+        ? !!settings.personalityText || !!settings.characterName
+        : settings.characterId !== null;
+    if (!hasCharacter) {
+        updateCommentaryText('Настрой персонажа в настройках~');
+        return;
+    }
+
+    addUserMessageToHistory(question);
+
+    meddler.isGenerating = true;
+    showTypingIndicator(true);
+    updateStatus('Думаю...');
+
+    try {
+        const prompt = buildChatPrompt(question);
+        let raw;
+        if (settings.quickApiEnabled && settings.quickApiUrl && settings.quickApiModel) {
+            const maxTokensMap = { short: 150, medium: 350, long: 700 };
+            const max_tokens = maxTokensMap[settings.commentaryLength] || 150;
+            raw = await postQuickApi([{ role: 'user', content: prompt }], max_tokens);
+        } else {
+            raw = await generateQuietPrompt(prompt, false, true);
+        }
+
+        const cleaned = cleanCommentaryResponse(raw) || (raw?.trim() || '');
+        const reply = cleaned || '*молчит*';
+        updateCommentaryText(reply);
+        if (cleaned) {
+            meddler.chatHistory.push({ role: 'user', content: question });
+            meddler.chatHistory.push({ role: 'assistant', content: cleaned });
+            const limit = Math.max(0, parseInt(settings.chatHistoryLimit) || 0);
+            const maxEntries = limit * 2;
+            if (maxEntries > 0 && meddler.chatHistory.length > maxEntries) {
+                meddler.chatHistory.splice(0, meddler.chatHistory.length - maxEntries);
+            }
+            meddler.lastCommentary = cleaned;
+        }
+        updateStatus('Наблюдаю...');
+    } catch (e) {
+        console.error(DEBUG_PREFIX, e);
+        updateCommentaryText(`*бормочет* (ошибка: ${e.message || 'API error'})`);
+        updateStatus('Ошибка!');
+    } finally {
+        meddler.isGenerating = false;
+        showTypingIndicator(false);
+    }
+}
+
 function updateStatus(status) {
     const el = meddler.widget?.querySelector('.meddler-status');
     if (el) el.textContent = status;
@@ -1153,6 +1362,7 @@ function onChatChanged() {
     settings.messageCount = 0; saveSettings();
     meddler.chatJustChanged = true;
     meddler.lastBarMessage = '';
+    meddler.chatHistory = [];
     setTimeout(() => { meddler.chatJustChanged = false; }, 2000);
     if (settings.autoShow) switchDisplayMode(settings.displayMode);
 
@@ -1402,6 +1612,26 @@ async function setupSettingsUI() {
                         <button id="meddler-context-lock" class="meddler-lock-btn"><i class="fa-solid fa-lock-open"></i></button>
                     </div>
                     <small>Сколько последних сообщений учитывать</small>
+                </div>
+
+                <hr class="sysHR" />
+                <h4 class="meddler-section-title">💬 Болтовня</h4>
+
+                <small class="meddler-hint">Открой панель (нажми на аватар) и спроси персонажа — он ответит с учётом РП и вашей прошлой беседы.</small>
+
+                <div class="meddler-setting-row">
+                    <label for="meddler-chat-memory">Память болтовни:</label>
+                    <div class="range-block">
+                        <input type="range" id="meddler-chat-memory" min="0" max="30" />
+                        <span id="meddler-chat-memory-value">10 реплик</span>
+                    </div>
+                    <small>Сколько последних реплик разговора персонаж помнит. 0 — без памяти.</small>
+                </div>
+
+                <div class="meddler-setting-row meddler-button-row">
+                    <button id="meddler-chat-clear" class="menu_button">
+                        <i class="fa-solid fa-broom"></i> Очистить память болтовни
+                    </button>
                 </div>
 
                 <hr class="sysHR" />
@@ -1677,6 +1907,30 @@ async function setupSettingsUI() {
         () => settings.maxContextMessages, v => { settings.maxContextMessages = v; saveSettings(); },
         () => settings.contextLocked, v => { settings.contextLocked = v; saveSettings(); },
         1, 30);
+
+    // Chat memory
+    {
+        const slider = document.getElementById('meddler-chat-memory');
+        const label  = document.getElementById('meddler-chat-memory-value');
+        if (slider && label) {
+            slider.value = settings.chatHistoryLimit;
+            label.textContent = `${settings.chatHistoryLimit} реплик`;
+            slider.addEventListener('input', e => {
+                settings.chatHistoryLimit = parseInt(e.target.value);
+                label.textContent = `${settings.chatHistoryLimit} реплик`;
+                saveSettings();
+            });
+        }
+        document.getElementById('meddler-chat-clear')?.addEventListener('click', () => {
+            meddler.chatHistory = [];
+            const btn = document.getElementById('meddler-chat-clear');
+            if (btn) {
+                const orig = btn.innerHTML;
+                btn.innerHTML = '<i class="fa-solid fa-check"></i> Очищено';
+                setTimeout(() => { btn.innerHTML = orig; }, 1200);
+            }
+        });
+    }
 
     // Autoshow
     bind('meddler-autoshow', 'change', e => { settings.autoShow = e.target.checked; saveSettings(); }, el => { el.checked = settings.autoShow; });

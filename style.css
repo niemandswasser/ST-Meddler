@@ -1029,3 +1029,71 @@
 .meddler-quickapi-buttons { display: flex; gap: 7px; }
 .meddler-loading { color: #7a9cc0; }
 .meddler-hint { opacity: 0.6; font-size: 11px; }
+
+/* ========================================
+   Chat input row (widget panel + bar panel)
+   ======================================== */
+.meddler-chat-input-row {
+    display: flex;
+    gap: 6px;
+    padding: 8px 10px;
+    border-top: 1px solid var(--kb-primary);
+    background: var(--kb-secondary);
+}
+
+#meddler-widget .meddler-chat-input,
+#meddler-bar .meddler-chat-input {
+    flex: 1;
+    min-width: 0;
+    padding: 6px 10px;
+    border: 1px solid var(--kb-primary);
+    border-radius: 6px;
+    background: #fff;
+    color: var(--kb-text);
+    font-size: 12px;
+    outline: none;
+    transition: border-color 0.15s ease;
+}
+
+#meddler-widget .meddler-chat-input:focus,
+#meddler-bar .meddler-chat-input:focus {
+    border-color: var(--kb-accent);
+}
+
+#meddler-widget .meddler-chat-input::placeholder,
+#meddler-bar .meddler-chat-input::placeholder {
+    color: var(--kb-text);
+    opacity: 0.4;
+}
+
+.meddler-chat-send {
+    border: none;
+    background: var(--kb-accent);
+    color: #fff;
+    padding: 0 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 12px;
+    transition: background 0.15s ease, transform 0.1s ease;
+}
+
+.meddler-chat-send:hover { background: var(--kb-primary); }
+.meddler-chat-send:active { transform: scale(0.95); }
+.meddler-chat-send:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Сообщения пользователя в истории (режим болтовни) */
+.meddler-history-item.user-msg {
+    background: color-mix(in srgb, var(--kb-accent) 15%, var(--kb-secondary));
+    border-left: 2px solid var(--kb-accent);
+    margin-left: 18px;
+}
+
+.meddler-history-item.user-msg::before {
+    content: "Ты:";
+    display: block;
+    font-size: 10px;
+    font-weight: 600;
+    opacity: 0.7;
+    margin-bottom: 2px;
+    color: var(--kb-accent);
+}
