@@ -152,6 +152,38 @@
 }
 
 /* ========================================
+   Active model badge
+   ======================================== */
+
+.meddler-model-badge {
+    position: absolute;
+    left: 50%;
+    bottom: -6px;
+    transform: translateX(-50%);
+    max-width: calc(var(--kb-avatar-size, 80px) + 40px);
+    padding: 2px 8px;
+    font-size: 10px;
+    line-height: 1.2;
+    color: var(--kb-text, #fff);
+    background: var(--kb-primary, rgba(30, 30, 40, 0.92));
+    border: 1px solid var(--kb-accent, rgba(255, 255, 255, 0.2));
+    border-radius: 10px;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    pointer-events: none;
+    z-index: 5;
+    user-select: none;
+}
+
+.meddler-bar-avatar .meddler-model-badge {
+    bottom: -4px;
+    font-size: 9px;
+    padding: 1px 6px;
+}
+
+/* ========================================
    Speech bubble — shared base
    ======================================== */
 

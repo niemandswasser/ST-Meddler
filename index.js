@@ -8,6 +8,7 @@ import {
     eventSource,
     event_types,
     generateQuietPrompt,
+    getRequestHeaders,
 } from '../../../../script.js';
 
 import {
@@ -65,7 +66,17 @@ const defaultSettings = {
     quickApiKey: '',
     quickApiModel: '',
     chatHistoryLimit: 10,
+    // Профиль подключения ST — меддлер шлёт запрос на нём, не трогая активный профиль таверны
+    connectionProfile: '',
+    // Показывать плашку с активной моделью рядом с аватаром
+    showActiveModel: false,
+    // Пер-чат сохранение истории: { [chatKey]: { updatedAt, messages: [{role, content, ts}] } }
+    perChatHistory: {},
 };
+
+// Лимиты пер-чат хранилища
+const PER_CHAT_MSG_LIMIT = 100;   // макс. реплик на чат
+const PER_CHAT_CHATS_LIMIT = 20;  // макс. чатов суммарно (старые авто-обрезаются)
 
 // Цветовые темы
 const UI_THEMES = {
@@ -112,6 +123,7 @@ let meddler = {
     chatJustChanged: false,
     sleepTimer: null,
     pendingBarText: null,
+    /** @type {Array<any>} */
     chatHistory: [],
 };
 
@@ -136,6 +148,98 @@ function loadSettings() {
 
 function getSettings() { return extension_settings[MODULE_NAME]; }
 function saveSettings() { saveSettingsDebounced(); }
+
+// =====================================
+// Пер-чат история (персистентная)
+// =====================================
+
+/** Ключ текущего ST-чата (chatId + характер). null, если чат ещё не открыт. */
+function getCurrentChatKey() {
+    try {
+        const ctx = SillyTavern.getContext();
+        const chatId = ctx.chatId || ctx.getCurrentChatId?.();
+        if (!chatId) return null;
+        const charPart = ctx.characterId != null ? `:char${ctx.characterId}` : (ctx.groupId ? `:grp${ctx.groupId}` : '');
+        return `${chatId}${charPart}`;
+    } catch {
+        return null;
+    }
+}
+
+function getPerChatStore() {
+    const s = getSettings();
+    if (!s.perChatHistory || typeof s.perChatHistory !== 'object') s.perChatHistory = {};
+    return s.perChatHistory;
+}
+
+/** Загрузить историю текущего чата из хранилища в meddler.chatHistory. */
+function loadChatHistoryForCurrentChat() {
+    const key = getCurrentChatKey();
+    if (!key) { meddler.chatHistory = []; return; }
+    const store = getPerChatStore();
+    const entry = store[key];
+    meddler.chatHistory = Array.isArray(entry?.messages) ? entry.messages.slice() : [];
+}
+
+/** Сохранить текущий meddler.chatHistory в хранилище для текущего чата + авто-обрезка. */
+function persistChatHistoryForCurrentChat() {
+    const key = getCurrentChatKey();
+    if (!key) return;
+    const store = getPerChatStore();
+    /** @type {Array<any>} */
+    const trimmed = meddler.chatHistory.slice(-PER_CHAT_MSG_LIMIT);
+    if (trimmed.length === 0) {
+        delete store[key];
+    } else {
+        store[key] = { updatedAt: Date.now(), messages: trimmed };
+    }
+    // Авто-обрезка старых чатов
+    const keys = Object.keys(store);
+    if (keys.length > PER_CHAT_CHATS_LIMIT) {
+        keys
+            .map(k => ({ k, t: store[k]?.updatedAt || 0 }))
+            .sort((a, b) => a.t - b.t)
+            .slice(0, keys.length - PER_CHAT_CHATS_LIMIT)
+            .forEach(({ k }) => { delete store[k]; });
+    }
+    saveSettings();
+}
+
+/**
+ * Записать одно сообщение в постоянную историю и сохранить.
+ * @param {'user'|'assistant'} role
+ * @param {string} content
+ */
+function pushPersistentMessage(role, content) {
+    if (!content) return;
+    meddler.chatHistory.push(/** @type {any} */ ({ role, content, ts: Date.now() }));
+    if (meddler.chatHistory.length > PER_CHAT_MSG_LIMIT) {
+        meddler.chatHistory.splice(0, meddler.chatHistory.length - PER_CHAT_MSG_LIMIT);
+    }
+    persistChatHistoryForCurrentChat();
+}
+
+/** Перерисовать панель истории из meddler.chatHistory (в обратном порядке — новые сверху). */
+function rerenderHistoryPanel() {
+    /** @type {Array<any>} */
+    const items = meddler.chatHistory.slice().reverse();
+    /** @type {Array<HTMLElement|null>} */
+    const containers = [meddler.widget, meddler.bar];
+    containers.forEach(el => {
+        if (!el) return;
+        const h = el.querySelector('.meddler-history');
+        if (!h) return;
+        h.innerHTML = '';
+        for (const m of items) {
+            const item = document.createElement('div');
+            item.className = m.role === 'user' ? 'meddler-history-item user-msg' : 'meddler-history-item';
+            const p = document.createElement('p');
+            p.textContent = m.content;
+            item.appendChild(p);
+            h.appendChild(item);
+        }
+    });
+}
 
 // =====================================
 // Слэш-команды / профили
@@ -283,6 +387,246 @@ async function connectQuickApi() {
 }
 
 // =====================================
+// Профиль подключения ST — изолированный запрос
+// =====================================
+// Маппинг profile.api → ключ секрета (api_key_<source>). Перекрытия — где имя секрета не совпадает.
+/** @type {Record<string, string>} */
+const PROFILE_API_TO_SECRET_KEY = {
+    'oai': 'api_key_openai',
+    'google': 'api_key_makersuite',
+    'openrouter-text': 'api_key_openrouter',
+    'kcpp': 'api_key_koboldcpp',
+    'oobabooga': 'api_key_ooba',
+    'textgenerationwebui': 'api_key_ooba',
+};
+
+/** @param {string | undefined | null} apiName */
+function profileApiToSecretKey(apiName) {
+    if (!apiName) return null;
+    const lower = String(apiName).toLowerCase();
+    if (PROFILE_API_TO_SECRET_KEY[lower]) return PROFILE_API_TO_SECRET_KEY[lower];
+    return `api_key_${lower}`;
+}
+
+/**
+ * Читаем состояние секретов и возвращаем id активного секрета для ключа.
+ * @param {string} secretKey
+ * @returns {Promise<string|null>}
+ */
+async function getActiveSecretId(secretKey) {
+    try {
+        const res = await fetch('/api/secrets/read', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+        });
+        if (!res.ok) return null;
+        const state = await res.json();
+        const arr = state?.[secretKey];
+        if (!Array.isArray(arr)) return null;
+        const active = arr.find(/** @param {any} s */ s => s?.active);
+        return active?.id || null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Прямой POST в /api/secrets/rotate — без UI-событий (в отличие от rotateSecret из secrets.js).
+ * @param {string} secretKey
+ * @param {string} secretId
+ */
+async function rotateSecretServerOnly(secretKey, secretId) {
+    try {
+        const res = await fetch('/api/secrets/rotate', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            body: JSON.stringify({ key: secretKey, id: secretId }),
+        });
+        return res.ok;
+    } catch {
+        return false;
+    }
+}
+
+/** @param {string} profileName */
+function getConnectionProfile(profileName) {
+    if (!profileName) return null;
+    try {
+        const context = SillyTavern.getContext();
+        const cm = context.extensionSettings?.connectionManager;
+        if (!cm?.profiles?.length) return null;
+        return cm.profiles.find(/** @param {any} p */ p => p.name === profileName) || null;
+    } catch {
+        return null;
+    }
+}
+
+/** @param {any} resp */
+function extractTextFromProfileResponse(resp) {
+    if (!resp) return null;
+    if (typeof resp === 'string') return resp;
+    if (Array.isArray(resp)) {
+        const texts = resp.filter(/** @param {any} b */ b => b?.type === 'text' && typeof b.text === 'string').map(/** @param {any} b */ b => b.text);
+        if (texts.length) return texts.join('\n');
+    }
+    if (resp.content !== undefined && resp.content !== null) {
+        if (typeof resp.content === 'string') return resp.content;
+        if (Array.isArray(resp.content)) {
+            const texts = resp.content.filter(/** @param {any} b */ b => b?.type === 'text' && typeof b.text === 'string').map(/** @param {any} b */ b => b.text);
+            if (texts.length) return texts.join('\n');
+        }
+    }
+    if (resp.choices?.[0]?.message?.content) {
+        const c = resp.choices[0].message.content;
+        if (typeof c === 'string') return c;
+        if (Array.isArray(c)) {
+            const texts = c.filter(/** @param {any} b */ b => b?.type === 'text' && typeof b.text === 'string').map(/** @param {any} b */ b => b.text);
+            if (texts.length) return texts.join('\n');
+        }
+    }
+    if (typeof resp.text === 'string') return resp.text;
+    if (typeof resp.message === 'string') return resp.message;
+    if (resp.message?.content && typeof resp.message.content === 'string') return resp.message.content;
+    return null;
+}
+
+/**
+ * @param {string} prompt
+ * @param {number} max_tokens
+ */
+async function generateWithConnectionProfile(prompt, max_tokens) {
+    const settings = getSettings();
+    const context = SillyTavern.getContext();
+    if (!context.ConnectionManagerRequestService) {
+        throw new Error('ConnectionManagerRequestService недоступен');
+    }
+    const profile = getConnectionProfile(settings.connectionProfile);
+    if (!profile) throw new Error(`Профиль "${settings.connectionProfile}" не найден`);
+
+    const messages = [{ role: 'user', content: prompt }];
+
+    // Подхватываем авторизацию профиля. ConnectionManagerRequestService сам secret-id не применяет —
+    // бэкенд читает активный секрет для source. Временно переключаем активный секрет на тот,
+    // что указан в профиле, и восстанавливаем в finally. Прямой POST в /api/secrets/rotate
+    // не шлёт клиентских событий (не дёргает #main_api change → нет переподключения ST).
+    const profileSecretId = profile['secret-id'] || null;
+    const secretKey = profileApiToSecretKey(profile.api);
+    let previousSecretId = null;
+    let rotated = false;
+
+    if (profileSecretId && secretKey) {
+        try {
+            previousSecretId = await getActiveSecretId(secretKey);
+            if (previousSecretId !== profileSecretId) {
+                rotated = await rotateSecretServerOnly(secretKey, profileSecretId);
+                if (!rotated) console.warn(DEBUG_PREFIX, `Не удалось активировать secret-id профиля (${secretKey}). Используется активный секрет ST.`);
+            }
+        } catch (e) {
+            console.warn(DEBUG_PREFIX, 'Ошибка подмены секрета:', e);
+        }
+    }
+
+    try {
+        const response = await context.ConnectionManagerRequestService.sendRequest(
+            profile.id,
+            messages,
+            max_tokens,
+            {
+                stream: false,
+                extractData: true,
+                includePreset: true,
+                includeInstruct: true,
+            },
+        );
+
+        const text = extractTextFromProfileResponse(response);
+        if (text == null) throw new Error('Неверный формат ответа API');
+        return text.trim();
+    } finally {
+        if (rotated && previousSecretId && secretKey) {
+            await rotateSecretServerOnly(secretKey, previousSecretId).catch(() => {});
+        }
+    }
+}
+
+function populateProfileDropdown() {
+    const select = document.getElementById('meddler-profile-select');
+    if (!select) return;
+    const settings = getSettings();
+    select.innerHTML = '<option value="">— Использовать активный в ST —</option>';
+    try {
+        const context = SillyTavern.getContext();
+        const cm = context.extensionSettings?.connectionManager;
+        const profiles = cm?.profiles || [];
+        profiles.forEach(p => {
+            if (!p?.name) return;
+            const opt = document.createElement('option');
+            opt.value = p.name;
+            opt.textContent = p.name;
+            if (settings.connectionProfile === p.name) opt.selected = true;
+            select.appendChild(opt);
+        });
+    } catch (e) {
+        console.warn(DEBUG_PREFIX, 'Ошибка загрузки профилей:', e);
+    }
+    updateProfileStatus();
+}
+
+function getActiveModelLabel() {
+    const settings = getSettings();
+    if (settings.quickApiEnabled && settings.quickApiUrl && settings.quickApiModel) {
+        return { source: '⚡', name: settings.quickApiModel };
+    }
+    if (settings.connectionProfile) {
+        const p = getConnectionProfile(settings.connectionProfile);
+        if (p) return { source: '🧩', name: p.model || p.name || '?' };
+    }
+    try {
+        const context = SillyTavern.getContext();
+        const cm = context.extensionSettings?.connectionManager;
+        const activeId = cm?.selectedProfile;
+        const activeProfile = cm?.profiles?.find(/** @param {any} p */ p => p.id === activeId);
+        if (activeProfile) return { source: 'ST', name: activeProfile.model || activeProfile.name || '?' };
+    } catch {}
+    return { source: 'ST', name: '—' };
+}
+
+function updateActiveModelBadge() {
+    const settings = getSettings();
+    const show = !!settings.showActiveModel;
+    const { source, name } = getActiveModelLabel();
+    const text = `${source} ${name}`;
+    /** @type {Array<HTMLElement|null>} */
+    const containers = [meddler.widget, meddler.bar];
+    containers.forEach(el => {
+        if (!el) return;
+        const badge = /** @type {HTMLElement|null} */ (el.querySelector('.meddler-model-badge'));
+        if (!badge) return;
+        badge.style.display = show ? '' : 'none';
+        badge.setAttribute('title', `Активная модель: ${name}`);
+        const label = badge.querySelector('.meddler-model-badge-text');
+        if (label) label.textContent = text;
+    });
+}
+
+function updateProfileStatus() {
+    const settings = getSettings();
+    const el = document.getElementById('meddler-profile-status');
+    if (!el) return;
+    if (!settings.connectionProfile) {
+        el.innerHTML = '<span class="meddler-status-inactive">Профиль не задан — используется активный в ST</span>';
+        return;
+    }
+    const profile = getConnectionProfile(settings.connectionProfile);
+    if (!profile) {
+        el.innerHTML = `<span class="meddler-status-warning">⚠️ Профиль «${settings.connectionProfile}» не найден</span>`;
+        return;
+    }
+    const details = [profile.api, profile.model].filter(Boolean).join(' · ');
+    el.innerHTML = `<span class="meddler-status-active">✓ <strong>${profile.name}</strong>${details ? ' — ' + details : ''}</span>`;
+}
+
+// =====================================
 // Тема UI
 // =====================================
 function applyUITheme() {
@@ -355,6 +699,9 @@ function createWidget() {
                 <i class="fa-solid fa-ghost"></i>
             </div>
             <div class="meddler-notification-dot"></div>
+            <div class="meddler-model-badge" style="display:none;">
+                <span class="meddler-model-badge-text"></span>
+            </div>
         </div>
         <div class="meddler-speech-bubble">
             <div class="meddler-speech-content">
@@ -414,6 +761,9 @@ function createWidget() {
     applyUITheme();
     updateWidgetCharacter();
     setupWidgetEvents();
+    updateActiveModelBadge();
+    if (meddler.chatHistory.length === 0) loadChatHistoryForCurrentChat();
+    rerenderHistoryPanel();
     if (settings.sleepMode) sleepWidget();
 }
 
@@ -427,6 +777,9 @@ function createBar() {
         <div class="meddler-bar-avatar">
             <img class="meddler-bar-avatar-img" src="" alt="" />
             <div class="meddler-bar-avatar-placeholder"><i class="fa-solid fa-ghost"></i></div>
+            <div class="meddler-model-badge" style="display:none;">
+                <span class="meddler-model-badge-text"></span>
+            </div>
         </div>
         <div class="meddler-bar-content">
             <span class="meddler-bar-name">Meddler</span>
@@ -489,6 +842,9 @@ function createBar() {
     applyBarTheme();
     updateBarCharacter();
     setupBarEvents();
+    updateActiveModelBadge();
+    if (meddler.chatHistory.length === 0) loadChatHistoryForCurrentChat();
+    rerenderHistoryPanel();
 }
 
 // =====================================
@@ -621,8 +977,9 @@ function setupWidgetEvents() {
     bubbleClose?.addEventListener('click', (e) => { e.stopPropagation(); hideSpeechBubble(); });
     panelClose?.addEventListener('click', () => widget.classList.remove('panel-open'));
     panelClear?.addEventListener('click', () => {
-        const h = widget.querySelector('.meddler-history');
-        if (h) h.innerHTML = '';
+        meddler.chatHistory = [];
+        persistChatHistoryForCurrentChat();
+        rerenderHistoryPanel();
     });
 
     const chatInput = widget.querySelector('.meddler-chat-input');
@@ -747,8 +1104,10 @@ function setupBarEvents() {
     bar.querySelector('.meddler-panel-close')?.addEventListener('click', (e) => { e.stopPropagation(); closeBarPanel(); });
     bar.querySelector('.meddler-panel-clear')?.addEventListener('click', (e) => {
         e.stopPropagation();
-        const h = bar.querySelector('.meddler-history');
-        if (h) { h.innerHTML = ''; meddler.lastBarMessage = ''; }
+        meddler.chatHistory = [];
+        meddler.lastBarMessage = '';
+        persistChatHistoryForCurrentChat();
+        rerenderHistoryPanel();
     });
 
     const chatInput = bar.querySelector('.meddler-chat-input');
@@ -1229,6 +1588,14 @@ async function generateCommentary(force = false) {
             updateStatus('Генерирую...');
             const prompt = buildCommentaryPrompt();
             raw = await generateWithQuickApi(prompt);
+        } else if (settings.connectionProfile && getConnectionProfile(settings.connectionProfile)) {
+            // Генерация через отдельный профиль ST — активный профиль таверны не меняется
+            updateStatus('Генерирую (профиль)...');
+            const prompt = buildCommentaryPrompt();
+            /** @type {Record<string, number>} */
+            const maxTokensMap = { short: 150, medium: 350, long: 700 };
+            const max_tokens = maxTokensMap[settings.commentaryLength] || 150;
+            raw = await generateWithConnectionProfile(prompt, max_tokens);
         } else {
             // Стандартный путь через ST (текущие настройки генерации)
             const prompt = buildCommentaryPrompt();
@@ -1297,10 +1664,14 @@ async function generateChatReply(rawQuestion) {
     try {
         const prompt = buildChatPrompt(question);
         let raw;
+        /** @type {Record<string, number>} */
+        const maxTokensMap = { short: 150, medium: 350, long: 700 };
+        const max_tokens = maxTokensMap[settings.commentaryLength] || 150;
+
         if (settings.quickApiEnabled && settings.quickApiUrl && settings.quickApiModel) {
-            const maxTokensMap = { short: 150, medium: 350, long: 700 };
-            const max_tokens = maxTokensMap[settings.commentaryLength] || 150;
             raw = await postQuickApi([{ role: 'user', content: prompt }], max_tokens);
+        } else if (settings.connectionProfile && getConnectionProfile(settings.connectionProfile)) {
+            raw = await generateWithConnectionProfile(prompt, max_tokens);
         } else {
             raw = await generateQuietPrompt(prompt, false, true);
         }
@@ -1309,13 +1680,8 @@ async function generateChatReply(rawQuestion) {
         const reply = cleaned || '*молчит*';
         updateCommentaryText(reply);
         if (cleaned) {
-            meddler.chatHistory.push({ role: 'user', content: question });
-            meddler.chatHistory.push({ role: 'assistant', content: cleaned });
-            const limit = Math.max(0, parseInt(settings.chatHistoryLimit) || 0);
-            const maxEntries = limit * 2;
-            if (maxEntries > 0 && meddler.chatHistory.length > maxEntries) {
-                meddler.chatHistory.splice(0, meddler.chatHistory.length - maxEntries);
-            }
+            pushPersistentMessage('user', question);
+            pushPersistentMessage('assistant', cleaned);
             meddler.lastCommentary = cleaned;
         }
         updateStatus('Наблюдаю...');
@@ -1362,17 +1728,44 @@ function onChatChanged() {
     settings.messageCount = 0; saveSettings();
     meddler.chatJustChanged = true;
     meddler.lastBarMessage = '';
-    meddler.chatHistory = [];
+    loadChatHistoryForCurrentChat();
     setTimeout(() => { meddler.chatJustChanged = false; }, 2000);
     if (settings.autoShow) switchDisplayMode(settings.displayMode);
 
-    [meddler.widget, meddler.bar].forEach(el => {
-        const h = el?.querySelector('.meddler-history');
-        if (h) h.innerHTML = '';
-    });
+    rerenderHistoryPanel();
 
-    updateCommentaryText('Новый чат! Жду чего-нибудь интересного...');
+    if (meddler.chatHistory.length > 0) {
+        const last = meddler.chatHistory[meddler.chatHistory.length - 1];
+        if (last?.role === 'assistant' && last.content) {
+            meddler.lastCommentary = last.content;
+            setSpeechTextOnly(last.content);
+        } else {
+            setSpeechTextOnly('С возвращением~ Продолжаем?');
+        }
+    } else {
+        setSpeechTextOnly('Новый чат! Жду чего-нибудь интересного...');
+    }
     updateStatus('Наблюдаю...');
+}
+
+/**
+ * Обновить только текст пузыря и bar-строки, не трогая панель истории.
+ * @param {string} text
+ */
+function setSpeechTextOnly(text) {
+    /** @type {HTMLElement|null} */
+    const widget = meddler.widget;
+    if (widget) {
+        const speechText = widget.querySelector('.meddler-speech-bubble .meddler-text');
+        if (speechText) speechText.textContent = text;
+    }
+    /** @type {HTMLElement|null} */
+    const bar = meddler.bar;
+    if (bar) {
+        const textEl = bar.querySelector('.meddler-bar-text');
+        if (textEl) textEl.textContent = text;
+        meddler.lastBarMessage = text;
+    }
 }
 
 function updateDisplayModeOptions(mode) {
@@ -1538,7 +1931,37 @@ async function setupSettingsUI() {
                 <hr class="sysHR" />
                 <h4 class="meddler-section-title">🔌 API</h4>
 
-                <small class="meddler-hint">Укажите отдельный API во вкладке Quick API. В противном случае будут использованы активные настройки генерации.</small>
+                <small class="meddler-hint">Приоритет: Quick API → Профиль подключения → активные настройки ST. Профиль и Quick API шлют запросы изолированно, активный профиль ST не меняется.</small>
+
+                <div class="meddler-drawer">
+                    <div class="meddler-drawer-toggle" id="meddler-profile-drawer-toggle">
+                        <b>🧩 Профиль подключения ST</b>
+                        <i class="meddler-drawer-chevron fa-solid fa-chevron-down"></i>
+                    </div>
+                    <div class="meddler-drawer-content" id="meddler-profile-drawer-content">
+                        <small class="meddler-hint">Меддлер использует выбранный профиль SillyTavern, НЕ переключая активный профиль в таверне. Запросы ST и меддлера идут раздельно. Если в профиле задан secret-id, меддлер на время запроса подменит активный ключ этого источника и вернёт обратно после ответа (UI-переподключения ST не происходит). Пусто — используется активный профиль ST.</small>
+                        <div class="meddler-setting-row">
+                            <label for="meddler-profile-select">Профиль для меддлера:</label>
+                            <div class="meddler-model-row">
+                                <select id="meddler-profile-select" class="text_pole">
+                                    <option value="">— Использовать активный в ST —</option>
+                                </select>
+                                <button type="button" id="meddler-profile-refresh" class="menu_button" title="Обновить список профилей">
+                                    <i class="fa-solid fa-rotate"></i>
+                                </button>
+                            </div>
+                        </div>
+                        <div class="meddler-setting-row">
+                            <div id="meddler-profile-status" class="meddler-quickapi-status">
+                                <span class="meddler-status-inactive">Профиль не задан</span>
+                            </div>
+                        </div>
+                        <div class="meddler-setting-row meddler-quickapi-buttons">
+                            <button type="button" id="meddler-profile-check" class="menu_button"><i class="fa-solid fa-plug"></i> Проверить</button>
+                            <button type="button" id="meddler-profile-test" class="menu_button"><i class="fa-solid fa-flask"></i> Тест</button>
+                        </div>
+                    </div>
+                </div>
 
                 <div class="meddler-drawer">
                     <div class="meddler-drawer-toggle" id="meddler-quickapi-drawer-toggle">
@@ -1722,6 +2145,13 @@ async function setupSettingsUI() {
                                 <span id="meddler-sleep-timeout-value">8 сек</span>
                             </div>
                         </div>
+                    </div>
+                    <div class="meddler-setting-row">
+                        <label class="checkbox_label" for="meddler-show-active-model">
+                            <input type="checkbox" id="meddler-show-active-model" />
+                            <span>Показывать активную модель</span>
+                        </label>
+                        <small>Маленькое окошко у аватара: ⚡ Quick API, 🧩 Профиль или ST. По умолчанию выключено.</small>
                     </div>
                 </div>
 
@@ -1923,6 +2353,8 @@ async function setupSettingsUI() {
         }
         document.getElementById('meddler-chat-clear')?.addEventListener('click', () => {
             meddler.chatHistory = [];
+            persistChatHistoryForCurrentChat();
+            rerenderHistoryPanel();
             const btn = document.getElementById('meddler-chat-clear');
             if (btn) {
                 const orig = btn.innerHTML;
@@ -2071,6 +2503,12 @@ async function setupSettingsUI() {
         }
     }
 
+    bind('meddler-show-active-model', 'change', /** @param {any} e */ e => {
+        settings.showActiveModel = e.target.checked;
+        saveSettings();
+        updateActiveModelBadge();
+    }, /** @param {any} el */ el => { el.checked = !!settings.showActiveModel; });
+
     // Ticker
     const tickerSpeed = document.getElementById('meddler-ticker-speed');
     const tickerLabel = document.getElementById('meddler-ticker-speed-value');
@@ -2085,8 +2523,88 @@ async function setupSettingsUI() {
     }
     bind('meddler-ticker-always', 'change', e => { settings.uiTickerAlwaysScroll = e.target.checked; saveSettings(); applyBarTickerAnimation(); }, el => { el.checked = settings.uiTickerAlwaysScroll; });
 
+    // Connection Profile (ST) — isolated generation profile
+    {
+        const toggle  = document.getElementById('meddler-profile-drawer-toggle');
+        const content = document.getElementById('meddler-profile-drawer-content');
+        if (toggle && content) {
+            toggle.addEventListener('click', () => {
+                const isOpen = content.classList.contains('open');
+                content.classList.toggle('open', !isOpen);
+                toggle.querySelector('.meddler-drawer-chevron')?.classList.toggle('rotated', !isOpen);
+            });
+        }
+    }
+    document.getElementById('meddler-profile-select')?.addEventListener('change', e => {
+        settings.connectionProfile = /** @type {HTMLSelectElement} */ (e.target).value || '';
+        saveSettings();
+        updateProfileStatus();
+        updateActiveModelBadge();
+    });
+    document.getElementById('meddler-profile-refresh')?.addEventListener('click', () => populateProfileDropdown());
+    populateProfileDropdown();
+
+    // Профиль: кнопка «Проверить»
+    document.getElementById('meddler-profile-check')?.addEventListener('click', async () => {
+        const btn = document.getElementById('meddler-profile-check');
+        if (!(btn instanceof HTMLButtonElement)) return;
+        const orig = btn.innerHTML;
+        try {
+            if (!settings.connectionProfile) { alert('Сначала выбери профиль из списка!'); return; }
+            const profile = getConnectionProfile(settings.connectionProfile);
+            if (!profile) { alert(`Профиль «${settings.connectionProfile}» не найден. Нажми ⟳ для обновления.`); return; }
+            const ctx = SillyTavern.getContext();
+            if (!ctx.ConnectionManagerRequestService) { alert('Connection Manager недоступен в этом ST.'); return; }
+            // Проверяем, что профиль поддерживается CM
+            const supported = /** @type {any[]} */ (ctx.ConnectionManagerRequestService.getSupportedProfiles?.() || [])
+                .some(/** @param {any} p */ p => p.id === profile.id);
+            if (!supported) { alert(`Профиль «${profile.name}» не поддерживается Connection Manager (тип API: ${profile.api || '—'}).`); return; }
+
+            const lines = [
+                `✓ Профиль найден: «${profile.name}»`,
+                `API: ${profile.api || '—'}`,
+                `Модель: ${profile.model || '—'}`,
+                `URL: ${profile['api-url'] || '(по умолчанию)'}`,
+                `Preset: ${profile.preset || '—'}`,
+                `Proxy: ${profile.proxy ? 'задан' : '—'}`,
+                `Ключ профиля: ${profile['secret-id'] ? 'задан ✓' : 'не задан (будет использован активный секрет ST)'}`,
+            ];
+            btn.innerHTML = '<i class="fa-solid fa-check"></i> ОК';
+            setTimeout(() => { btn.innerHTML = orig; }, 1500);
+            alert(lines.join('\n'));
+        } catch (e) {
+            btn.innerHTML = orig;
+            const msg = /** @type {any} */ (e)?.message || e;
+            alert(`Ошибка проверки: ${msg}`);
+        }
+    });
+
+    // Профиль: кнопка «Тест» — реальный запрос через профиль, вывод результата
+    document.getElementById('meddler-profile-test')?.addEventListener('click', async () => {
+        const btn = document.getElementById('meddler-profile-test');
+        if (!(btn instanceof HTMLButtonElement)) return;
+        if (!settings.connectionProfile) { alert('Сначала выбери профиль!'); return; }
+        if (!getConnectionProfile(settings.connectionProfile)) { alert('Профиль не найден. Нажми ⟳ для обновления.'); return; }
+        const orig = btn.innerHTML;
+        try {
+            btn.disabled = true;
+            btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Генерирую...';
+            const testPrompt = 'Ответь одной короткой репликой по-русски: скажи "Привет, меддлер на связи!" и больше ничего.';
+            const reply = await generateWithConnectionProfile(testPrompt, 80);
+            btn.innerHTML = '<i class="fa-solid fa-check"></i> ОК';
+            setTimeout(() => { btn.innerHTML = orig; btn.disabled = false; }, 2000);
+            alert(`Ответ от профиля:\n\n${reply || '(пусто)'}`);
+        } catch (e) {
+            btn.innerHTML = '<i class="fa-solid fa-xmark"></i> Ошибка';
+            setTimeout(() => { btn.innerHTML = orig; btn.disabled = false; }, 2500);
+            const err = /** @type {any} */ (e);
+            const cause = err?.cause?.message || '';
+            alert(`Ошибка: ${err?.message || e}${cause ? `\n\n${cause}` : ''}`);
+        }
+    });
+
     // Quick API
-    bind('meddler-quickapi-enabled', 'change', e => { settings.quickApiEnabled = e.target.checked; updateQuickApiStatus(); saveSettings(); }, el => { el.checked = settings.quickApiEnabled; });
+    bind('meddler-quickapi-enabled', 'change', /** @param {any} e */ e => { settings.quickApiEnabled = e.target.checked; updateQuickApiStatus(); saveSettings(); updateActiveModelBadge(); }, /** @param {any} el */ el => { el.checked = settings.quickApiEnabled; });
 
     // Quick API drawer — собственный, не зависящий от ST-классов
     {
@@ -2125,7 +2643,7 @@ async function setupSettingsUI() {
             if (!val) return;
             settings.quickApiModel = val;
             if (modelInput) modelInput.value = ''; // сбрасываем ручной ввод
-            updateQuickApiStatus(); saveSettings();
+            updateQuickApiStatus(); saveSettings(); updateActiveModelBadge();
         });
     }
 
@@ -2134,7 +2652,7 @@ async function setupSettingsUI() {
             const val = e.target.value.trim();
             settings.quickApiModel = val;
             if (val && modelSelect) modelSelect.value = ''; // сбрасываем select
-            updateQuickApiStatus(); saveSettings();
+            updateQuickApiStatus(); saveSettings(); updateActiveModelBadge();
         });
     }
 
@@ -2211,12 +2729,14 @@ jQuery(async () => {
     eventSource.on(event_types.SETTINGS_LOADED, () => {
         setTimeout(async () => {
             populateCharacterDropdown();
+            populateProfileDropdown();
             updateWidgetCharacter(); updateBarCharacter();
+            updateActiveModelBadge();
         }, 500);
     });
 
-    setTimeout(populateCharacterDropdown, 1000);
-    setTimeout(populateCharacterDropdown, 3000);
+    setTimeout(() => { populateCharacterDropdown(); populateProfileDropdown(); updateActiveModelBadge(); }, 1000);
+    setTimeout(() => { populateCharacterDropdown(); populateProfileDropdown(); updateActiveModelBadge(); }, 3000);
 
     console.log(DEBUG_PREFIX, 'ST-Meddler готов!');
 });
